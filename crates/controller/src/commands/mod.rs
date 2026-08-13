@@ -4,6 +4,7 @@ pub mod commissioning;
 pub mod credentials;
 pub mod fabrics;
 pub mod interaction;
+pub mod misc;
 pub mod nodes;
 
 use serde_json::{Map, Value};

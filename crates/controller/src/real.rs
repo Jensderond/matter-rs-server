@@ -158,7 +158,14 @@ impl Controller for MatterController {
             "remove_matter_fabric" => commands::fabrics::remove_matter_fabric(self, args).await,
             "set_acl_entry" => commands::fabrics::set_acl_entry(self, args).await,
             "set_node_binding" => commands::fabrics::set_node_binding(self, args).await,
-            // Task 11 extends this match (icd, ota, etc). The catch-all stays last.
+            "get_vendor_names" => commands::misc::get_vendor_names(self, args).await,
+            "get_loglevel" => commands::misc::get_loglevel(self, args).await,
+            "set_loglevel" => commands::misc::set_loglevel(self, args).await,
+            "get_icd_state" | "register_icd" | "unregister_icd" => commands::misc::icd_state(self, args).await,
+            "resync_icd" => commands::misc::resync_icd(self, args).await,
+            "check_node_update" => commands::misc::check_node_update(self, args).await,
+            "update_node" => commands::misc::update_node(self, args).await,
+            // The catch-all stays last.
             other => Err(CommandError::new(
                 ServerErrorCode::InvalidCommand, format!("Unknown command: {other}"))),
         }

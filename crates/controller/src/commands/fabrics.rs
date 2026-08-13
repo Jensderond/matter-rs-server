@@ -77,7 +77,7 @@ pub async fn get_matter_fabrics(c: &MatterController, args: &Map<String, Value>)
                 vendor_id: f.vendor_id,
                 fabric_index: f.fabric_index,
                 fabric_label: Some(f.fabric_label),
-                vendor_name: crate::vendors::name(f.vendor_id),
+                vendor_name: crate::vendors::name(f.vendor_id).map(str::to_owned),
             })
             .unwrap()
         })
