@@ -20,8 +20,11 @@ pub const EVENT_HISTORY_SIZE: usize = 25;
 pub struct NodeManager;
 
 impl NodeManager {
-    /// Spawns the consumer task. `events` is the broadcast sender OWNED BY
-    /// MatterController for its whole life (carryover: never rotate it).
+    /// Spawns the consumer task. `events` is taken by value, but it's a
+    /// `broadcast::Sender` clone — cloning a sender shares the same
+    /// underlying channel, it doesn't create a new one. Caller contract:
+    /// pass a clone of the single `Sender` OWNED BY MatterController for its
+    /// whole life (carryover: never rotate/replace that original sender).
     pub fn spawn(
         registry: Arc<Registry>,
         storage: Arc<Storage>,
@@ -51,15 +54,38 @@ async fn run(
                 handle_event(&registry, &storage, &events, &history, &mut grace_timers, &grace_tx, ev);
             }
             Some(node_id) = grace_rx.recv() => {
-                grace_timers.remove(&node_id);
-                if registry.set_available(node_id, false) == Some(true) {
-                    tracing::warn!("Node {node_id} offline grace period expired, marking unavailable");
-                    emit_node_updated(&registry, &events, node_id);
-                }
+                handle_grace_expiry(&registry, &events, &mut grace_timers, node_id);
             }
         }
     }
     for (_, t) in grace_timers { t.abort(); }
+}
+
+/// Handles one grace-timer expiry signal drained from `grace_rx`.
+///
+/// A live `Connected` may have already removed (and no-op aborted, since it
+/// had already run to completion) this node's timer entry between the sleep
+/// firing and this branch running — `tokio::select!` can service `rx` first
+/// in the same tick, or in an earlier loop iteration, while this signal sits
+/// queued. The map entry's absence is how a stale expiry signal is told
+/// apart from a real one: `grace_timers` is only ever mutated on this one
+/// consumer loop, so if the entry is gone the timer was already invalidated
+/// — drop the signal instead of flipping a freshly-reconnected node back to
+/// unavailable (which would otherwise stick until the next state
+/// transition, since nothing else would ever correct it).
+fn handle_grace_expiry(
+    registry: &Registry,
+    events: &broadcast::Sender<EventMessage>,
+    grace_timers: &mut HashMap<u64, tokio::task::JoinHandle<()>>,
+    node_id: u64,
+) {
+    if grace_timers.remove(&node_id).is_none() {
+        return;
+    }
+    if registry.set_available(node_id, false) == Some(true) {
+        tracing::warn!("Node {node_id} offline grace period expired, marking unavailable");
+        emit_node_updated(registry, events, node_id);
+    }
 }
 
 fn handle_event(
@@ -156,6 +182,12 @@ fn build_node_event(node_id: u64, event: NodeEventData) -> MatterNodeEvent {
     }
 }
 
+/// TOCTOU note (accepted, not an oversight): the caller already checked
+/// `registry.contains(node_id)`, but node removal happens on a different task
+/// (e.g. a remove-node command) and isn't serialized through this consumer
+/// loop, so the node can vanish between that check and here. `node_data`
+/// returning `None` then silently skips the emit — fine, there's nothing
+/// left to report.
 fn emit_node_updated(registry: &Registry, events: &broadcast::Sender<EventMessage>, node_id: u64) {
     if let Some(nd) = registry.node_data(node_id) {
         let _ = events.send(EventMessage {
@@ -165,6 +197,9 @@ fn emit_node_updated(registry: &Registry, events: &broadcast::Sender<EventMessag
     }
 }
 
+/// Same TOCTOU note as `emit_node_updated`: a concurrent removal between the
+/// caller's `contains` check and here just means `snapshot_record` returns
+/// `None` and we skip the write — accepted.
 fn persist(registry: &Registry, storage: &Storage, node_id: u64) {
     if let Some(rec) = registry.snapshot_record(node_id) {
         if let Err(e) = storage.save_node(&rec) {
@@ -252,6 +287,58 @@ mod tests {
         tokio::time::advance(RECONNECT_GRACE * 2).await;
         tokio::task::yield_now().await;
         assert!(r.registry.node_data(7).unwrap().available);
+    }
+
+    /// Regression for the stale-expiry race (fix round 1): a live `Connected`
+    /// can remove (and no-op abort, since it already ran to completion) a
+    /// node's timer entry from `grace_timers` *before* that timer's expiry
+    /// signal — already sitting in `grace_rx` — gets drained. This directly
+    /// exercises `handle_grace_expiry` with the entry ABSENT (simulating
+    /// "Connected already claimed it") rather than racing the real async
+    /// select loop: `tokio::select!` picks pseudo-randomly between ready
+    /// branches, so driving the actual race through `NodeManager::spawn` is
+    /// nondeterministic and would make this test flaky (confirmed
+    /// empirically — see task-6-report.md). Calling the exact fixed
+    /// function directly pins down the precondition deterministically.
+    #[tokio::test]
+    async fn stale_grace_expiry_after_connected_claimed_it_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let rec = NodeRecord { node_id: 7, date_commissioned: "d".into(), last_interview: "l".into(),
+                               device_fabric_index: 1, addresses: vec![], attributes: serde_json::Map::new() };
+        storage.save_node(&rec).unwrap();
+        let registry = Registry::new(vec![rec]);
+        registry.set_available(7, true);
+        let (etx, mut erx) = tokio::sync::broadcast::channel::<matter_rs_wire::envelope::EventMessage>(8);
+        let mut grace_timers: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
+        // grace_timers does NOT contain node 7: this is exactly the state
+        // left behind once a Connected has already removed+aborted the
+        // (by-then-finished) timer task before this stale signal is handled.
+        handle_grace_expiry(&registry, &etx, &mut grace_timers, 7);
+        assert!(registry.node_data(7).unwrap().available, "stale signal must not flip availability");
+        assert!(erx.try_recv().is_err(), "stale signal must not emit a node_updated");
+    }
+
+    /// Sanity counterpart: when the timer entry IS still live (no Connected
+    /// raced ahead of it), a real expiry still marks the node unavailable
+    /// and emits `node_updated` — the fix only guards the stale case.
+    #[tokio::test]
+    async fn live_grace_expiry_still_marks_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let rec = NodeRecord { node_id: 7, date_commissioned: "d".into(), last_interview: "l".into(),
+                               device_fabric_index: 1, addresses: vec![], attributes: serde_json::Map::new() };
+        storage.save_node(&rec).unwrap();
+        let registry = Registry::new(vec![rec]);
+        registry.set_available(7, true);
+        let (etx, mut erx) = tokio::sync::broadcast::channel::<matter_rs_wire::envelope::EventMessage>(8);
+        let mut grace_timers: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
+        grace_timers.insert(7, tokio::spawn(async {}));
+        handle_grace_expiry(&registry, &etx, &mut grace_timers, 7);
+        assert!(!registry.node_data(7).unwrap().available);
+        let ev = erx.try_recv().unwrap();
+        assert_eq!(ev.event, "node_updated");
+        assert_eq!(ev.data["available"], false);
     }
 
     #[tokio::test]
