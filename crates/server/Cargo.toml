@@ -1,0 +1,24 @@
+[package]
+name = "matter-rs-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "matter-rs-server"
+path = "src/main.rs"
+
+[dependencies]
+matter-rs-wire = { path = "../wire" }
+matter-rs-controller = { path = "../controller" }
+tokio.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
