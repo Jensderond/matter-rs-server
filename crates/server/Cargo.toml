@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "matter_rs_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "matter-rs-server"
 path = "src/main.rs"
