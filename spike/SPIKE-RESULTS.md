@@ -81,14 +81,43 @@ Identical full pass: discovery (link-local IPv6, sub-second) → PASE → AddNOC
 multicast + link-local UDP alongside the protocol flow. Debug build compiles
 in ~3 min warm / ~30 min cold on the container.
 
-## Leg 2 — real devices (pending)
+## Leg 2 — real device: IKEA TOFSMYGGA outdoor plug, Thread (2026-08-13)
 
-Blocked on: dev machine tailnet connectivity + a pairing code from HA
-("Share device" on a plug/light, second fabric — production untouched).
+HA "Share device" manual pairing code, commissioned into a second (spike)
+fabric from CT 110. The plug is a **Thread** device behind the existing
+border routers — so this leg also exercised the Thread data path.
 
-## Verdict so far
+| Stage | Result |
+|---|---|
+| Manual pairing code parse (short discriminator) | OK |
+| Discovery (BR advertising proxy → Thread ULA) | OK, sub-second |
+| PASE over Thread | OK |
+| Commission (RCAC-direct) + CASE + Complete | OK (device fabric #3) |
+| BasicInformation | `IKEA of Sweden` / `TOFSMYGGA plug outdoor` |
+| OnOff toggle (physical plug) | OK, false→true→false |
 
-**GO (provisional).** Everything the server design depends on works against
-the strictest available peer (matter.js — the same stack the current
-production matterjs-server runs). RCAC-direct sidesteps the one blocker.
-Final GO after Leg 2 on real hardware.
+### Finding 4 (deployment requirement): Thread mesh route via RA route-info
+
+First attempt failed with `Network is unreachable` sending to the plug's
+Thread ULA: the LXC ignores RA route-information options by default, so the
+border routers' `fd6a:.../64` route never got installed. Fix (now persisted
+on CT 110 in `/etc/sysctl.d/99-matter-thread.conf`):
+
+```
+net.ipv6.conf.eth0.accept_ra_rt_info_max_plen = 64
+```
+
+plus an RA solicitation (`rdisc6 eth0`, package `ndisc6`) to avoid waiting
+for the periodic RA. Matches the Node server's os_requirements doc. Must be
+part of the server's deployment docs/checks — a fresh LXC will hit this.
+
+Leftover: the spike fabric remains on the plug (visible in HA under the
+device's "connected fabrics"); remove it there, or ignore it.
+
+## Verdict
+
+**GO.** Full commissioner pipeline validated against matter.js (strictest
+peer), on the target platform, and against real Thread hardware. Known
+constraints for the server: RCAC-direct mode (finding 1), PASE lockout
+handling (finding 2), mDNS socket/interface care (finding 3), RA route-info
+deployment requirement (finding 4).
