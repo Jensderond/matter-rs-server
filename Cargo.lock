@@ -661,6 +661,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "matter-rs-gen"
+version = "0.1.0"
+
+[[package]]
 name = "matter-rs-server"
 version = "0.1.0"
 dependencies = [
