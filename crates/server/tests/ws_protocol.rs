@@ -60,3 +60,45 @@ async fn malformed_json_gets_invalid_arguments_error() {
     assert_eq!(resp["error_code"], 8);
     assert_eq!(resp["message_id"], "");
 }
+
+#[tokio::test]
+async fn events_only_after_start_listening() {
+    let stub = Arc::new(StubController::new(test_server_info()));
+    let sender = stub.event_sender();
+    let (addr, _s) = spawn_server(stub).await;
+    let mut ws = connect(addr).await;
+    let _hello = next_json(&mut ws).await;
+
+    // Event before start_listening: must NOT be delivered.
+    sender.send(matter_rs_wire::envelope::EventMessage { event: "node_added".into(), data: json!({"node_id": 5}) }).unwrap();
+
+    ws.send(Message::text(r#"{"message_id":"1","command":"start_listening"}"#)).await.unwrap();
+    let resp = next_json(&mut ws).await;
+    assert_eq!(resp["message_id"], "1"); // the pre-listening event was dropped
+
+    sender.send(matter_rs_wire::envelope::EventMessage { event: "node_updated".into(), data: json!({"node_id": 6}) }).unwrap();
+    let ev = next_json(&mut ws).await;
+    assert_eq!(ev, json!({"event": "node_updated", "data": {"node_id": 6}}));
+}
+
+#[tokio::test]
+async fn shutdown_sends_server_shutdown_event_and_closes() {
+    let stub = Arc::new(StubController::new(test_server_info()));
+    let (addr, shutdown) = spawn_server(stub).await;
+    let mut ws = connect(addr).await;
+    let _hello = next_json(&mut ws).await;
+    ws.send(Message::text(r#"{"message_id":"1","command":"start_listening"}"#)).await.unwrap();
+    let _resp = next_json(&mut ws).await;
+
+    shutdown.send(true).unwrap();
+    let ev = next_json(&mut ws).await;
+    assert_eq!(ev["event"], "server_shutdown");
+    // Then the server closes the socket.
+    loop {
+        match ws.next().await {
+            None | Some(Err(_)) => break,
+            Some(Ok(Message::Close(_))) => break,
+            Some(Ok(_)) => continue,
+        }
+    }
+}

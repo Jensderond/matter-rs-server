@@ -9,11 +9,16 @@
 //!    (`ServerErrorCode::InvalidArguments`) — provisional; plan 3 verifies
 //!    this against Node fixtures.
 //! 4. `start_listening` additionally flips the connection into listening
-//!    mode; Task 10 uses that flag to start forwarding events.
+//!    mode; controller events are forwarded as `{"event","data"}` frames
+//!    only while listening, dropped otherwise.
+//! 5. A `true` on the shared shutdown watch (or the sender being dropped)
+//!    sends a `{"event":"server_shutdown","data":null}` frame and closes
+//!    the connection, regardless of listening state.
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::response::Response;
+use futures_util::SinkExt;
 
 use matter_rs_wire::envelope::{CommandMessage, ErrorResult, SuccessResult};
 use matter_rs_wire::error::ServerErrorCode;
@@ -35,35 +40,57 @@ async fn handle_connection(mut socket: WebSocket, state: AppState) {
         return;
     }
 
+    let mut events = state.controller.subscribe_events();
+    let mut shutdown = state.shutdown.clone();
     let mut listening = false;
 
-    while let Some(Ok(msg)) = socket.recv().await {
-        let Message::Text(text) = msg else { continue };
-
-        let cmd: CommandMessage = match serde_json::from_str(&text) {
-            Ok(c) => c,
-            Err(e) => {
-                let err = ErrorResult::new(String::new(), ServerErrorCode::InvalidArguments, e.to_string());
-                if socket.send(Message::Text(serde_json::to_string(&err).unwrap().into())).await.is_err() {
+    loop {
+        tokio::select! {
+            msg = socket.recv() => {
+                let Some(Ok(msg)) = msg else { return };
+                let Message::Text(text) = msg else { continue };
+                let frame = handle_text_frame(&state, &text, &mut listening).await;
+                if socket.send(Message::Text(frame.into())).await.is_err() { return; }
+            }
+            ev = events.recv() => {
+                match ev {
+                    Ok(ev) if listening => {
+                        let frame = serde_json::to_string(&ev).unwrap();
+                        if socket.send(Message::Text(frame.into())).await.is_err() { return; }
+                    }
+                    Ok(_) => {}                       // not listening: drop
+                    Err(_) => {}                      // lagged/closed: keep serving commands
+                }
+            }
+            res = shutdown.changed() => {
+                // A dropped sender (Err) is treated as shutdown too — otherwise
+                // changed() returns Err instantly forever and this arm busy-loops.
+                if res.is_err() || *shutdown.borrow() {
+                    let bye = serde_json::json!({"event": "server_shutdown", "data": null});
+                    let _ = socket.send(Message::Text(bye.to_string().into())).await;
+                    let _ = socket.close().await;
                     return;
                 }
-                continue;
             }
-        };
-
-        let is_start_listening = cmd.command == "start_listening";
-        let frame = match state.controller.handle_command(&cmd).await {
-            Ok(result) => {
-                if is_start_listening {
-                    listening = true; // Task 10 forwards events based on this
-                }
-                serde_json::to_string(&SuccessResult { message_id: cmd.message_id, result }).unwrap()
-            }
-            Err(e) => serde_json::to_string(&ErrorResult::new(cmd.message_id, e.code, e.details)).unwrap(),
-        };
-        if socket.send(Message::Text(frame.into())).await.is_err() {
-            return;
         }
     }
-    let _ = listening; // consumed for real in Task 10
+}
+
+async fn handle_text_frame(state: &AppState, text: &str, listening: &mut bool) -> String {
+    let cmd: CommandMessage = match serde_json::from_str(text) {
+        Ok(c) => c,
+        Err(e) => {
+            return serde_json::to_string(&ErrorResult::new(
+                String::new(), ServerErrorCode::InvalidArguments, e.to_string(),
+            )).unwrap();
+        }
+    };
+    let is_start_listening = cmd.command == "start_listening";
+    match state.controller.handle_command(&cmd).await {
+        Ok(result) => {
+            if is_start_listening { *listening = true; }
+            serde_json::to_string(&SuccessResult { message_id: cmd.message_id, result }).unwrap()
+        }
+        Err(e) => serde_json::to_string(&ErrorResult::new(cmd.message_id, e.code, e.details)).unwrap(),
+    }
 }
