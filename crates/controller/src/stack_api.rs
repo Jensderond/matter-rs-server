@@ -175,6 +175,7 @@ pub mod fake {
         pub fabrics_response: Mutex<Option<Result<Vec<DeviceFabric>, StackError>>>,
         pub addresses_response: Mutex<Option<Result<Vec<String>, StackError>>>,
         pub browse_response: Mutex<Option<Result<Vec<DiscoveredDevice>, StackError>>>,
+        pub label_response: Mutex<Option<Result<(), StackError>>>,
     }
 
     impl FakeStack {
@@ -188,7 +189,13 @@ pub mod fake {
     #[async_trait::async_trait]
     impl Stack for FakeStack {
         async fn commission(&self, req: CommissionRequest) -> Result<CommissionOutcome, StackError> {
-            self.log(format!("commission node_id={}", req.node_id));
+            let target_desc = match &req.target {
+                PaseTarget::Code { code } => format!("code={code}"),
+                PaseTarget::OnNetwork { passcode, long_discriminator, short_discriminator, vendor_id } =>
+                    format!("onnetwork passcode={passcode} long={long_discriminator:?} short={short_discriminator:?} vendor={vendor_id:?}"),
+                PaseTarget::Address { passcode, addr } => format!("address passcode={passcode} addr={addr}"),
+            };
+            self.log(format!("commission node_id={} {target_desc}", req.node_id));
             self.commission_response.lock().unwrap().take().unwrap_or_else(|| Err(sdk_err()))
         }
         async fn read_attributes(&self, node_id: u64, paths: Vec<AttributePathSpec>, fabric_filtered: bool)
@@ -225,7 +232,7 @@ pub mod fake {
         }
         async fn update_fabric_label(&self, label: String) -> Result<(), StackError> {
             self.log(format!("update_fabric_label {label}"));
-            Ok(())
+            self.label_response.lock().unwrap().take().unwrap_or(Ok(()))
         }
         async fn start_supervisor(&self, node_id: u64) { self.log(format!("start_supervisor {node_id}")); }
         async fn stop_supervisor(&self, node_id: u64) { self.log(format!("stop_supervisor {node_id}")); }

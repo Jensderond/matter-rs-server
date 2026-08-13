@@ -44,12 +44,7 @@ pub async fn set_default_fabric_label(
     let label = normalize_fabric_label(label_arg);
     match c.stack.update_fabric_label(label.clone()).await {
         Ok(()) => {
-            let mut cfg = c.config.lock().unwrap().clone();
-            cfg.fabric_label = label;
-            if let Err(e) = c.storage.save_config(&cfg) {
-                tracing::error!("persist config: {e}");
-            }
-            *c.config.lock().unwrap() = cfg;
+            c.update_config(|cfg| cfg.fabric_label = label);
             Ok(Value::Null)
         }
         Err(e) => {
@@ -211,6 +206,23 @@ mod tests {
         // conn 1 closing releases ownership; conn 2 can now set
         r.ctrl.connection_closed(ConnId(1));
         r.ctrl.handle_command(ConnId(2), &cmd("set_default_fabric_label", json!({"label": "Second"}))).await.unwrap();
+        let v = call(&r, "get_fabric_label", json!({})).await.unwrap();
+        assert_eq!(v, json!({"fabric_label": "Second"}));
+    }
+
+    #[tokio::test]
+    async fn set_default_fabric_label_stack_error_releases_fresh_ownership() {
+        let r = rig();
+        *r.stack.label_response.lock().unwrap() = Some(Err(crate::stack_api::StackError::new(
+            crate::stack_api::StackErrorKind::Sdk, "device rejected label")));
+        let e = r.ctrl.handle_command(ConnId(1), &cmd("set_default_fabric_label", json!({"label": "Casa"}))).await.unwrap_err();
+        assert_eq!(e.code.code(), 7);
+        // fabric_label was never persisted on failure
+        let v = call(&r, "get_fabric_label", json!({})).await.unwrap();
+        assert_eq!(v, json!({"fabric_label": "HomeAssistant"}));
+        // ownership was released (this call claimed it fresh): conn 2 can now claim and succeed
+        let v = r.ctrl.handle_command(ConnId(2), &cmd("set_default_fabric_label", json!({"label": "Second"}))).await.unwrap();
+        assert_eq!(v, serde_json::Value::Null);
         let v = call(&r, "get_fabric_label", json!({})).await.unwrap();
         assert_eq!(v, json!({"fabric_label": "Second"}));
     }

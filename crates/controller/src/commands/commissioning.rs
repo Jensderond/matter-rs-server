@@ -30,17 +30,14 @@ async fn do_commission(c: &MatterController, target: PaseTarget) -> Result<Value
     let _guard = c.alloc_lock.lock().await;
 
     // Allocate + persist the node id BEFORE commissioning (never hold the
-    // std config Mutex across an await: clone, mutate, save, write back).
-    let mut cfg = c.config.lock().unwrap().clone();
-    let node_id = allocate_node_id(&mut cfg, |id| {
-        c.registry.contains(id) || id == c.identity.controller_node_id
+    // std config Mutex across an await: update_config clones, mutates,
+    // saves, and writes back synchronously, all before the await below).
+    let node_id = c.update_config(|cfg| {
+        allocate_node_id(cfg, |id| c.registry.contains(id) || id == c.identity.controller_node_id)
     });
-    if let Err(e) = c.storage.save_config(&cfg) {
-        tracing::error!("persist config: {e}");
-    }
-    *c.config.lock().unwrap() = cfg.clone();
+    let fabric_label = c.config_snapshot().fabric_label;
 
-    let req = CommissionRequest { node_id, target, fabric_label: cfg.fabric_label.clone() };
+    let req = CommissionRequest { node_id, target, fabric_label };
     let outcome = c.stack.commission(req).await.map_err(|e| {
         err(ServerErrorCode::NodeCommissionFailed, format!("Commission failed: {}", e.message))
     })?;
@@ -71,7 +68,9 @@ async fn do_commission(c: &MatterController, target: PaseTarget) -> Result<Value
         tracing::error!("persist node {node_id}: {e}");
     }
 
-    let node_data = c.registry.node_data(node_id).expect("just inserted");
+    let node_data = c.registry.node_data(node_id).ok_or_else(|| {
+        err(ServerErrorCode::SdkStackError, "node vanished immediately after commissioning (internal error)")
+    })?;
     let value = serde_json::to_value(&node_data).unwrap();
     let _ = c.events.send(matter_rs_wire::envelope::EventMessage {
         event: "node_added".into(),
@@ -220,6 +219,53 @@ mod tests {
         assert_eq!(e.code.code(), 1);
         assert!(e.details.starts_with("Commission failed: "));
         assert!(e.details.contains("busy"));
+    }
+
+    #[tokio::test]
+    async fn commission_interview_failure_removes_fabric_and_maps_to_code_1() {
+        let r = rig();
+        *r.stack.commission_response.lock().unwrap() =
+            Some(Ok(CommissionOutcome { device_fabric_index: 7, address: "192.168.1.60:5540".into() }));
+        *r.stack.interview_response.lock().unwrap() = Some(Err(crate::stack_api::StackError::new(
+            crate::stack_api::StackErrorKind::Timeout, "interview timed out")));
+        let e = call(&r, "commission_with_code", json!({"code": "MT:TEST"})).await.unwrap_err();
+        assert_eq!(e.code.code(), 1);
+        assert!(e.details.starts_with("Commission failed: "));
+        assert!(e.details.contains("interview timed out"));
+        assert!(r.stack.calls().iter().any(|c| c == "remove_device_fabric node=1 idx=7"));
+        // best-effort cleanup only: the node must NOT have been registered
+        let e2 = call(&r, "get_node", json!({"node_id": 1})).await.unwrap_err();
+        assert_eq!(e2.code.code(), 5);
+    }
+
+    #[tokio::test]
+    async fn commission_on_network_ip_addr_uses_address_target() {
+        let r = rig();
+        *r.stack.commission_response.lock().unwrap() =
+            Some(Ok(CommissionOutcome { device_fabric_index: 1, address: "192.168.1.99:5540".into() }));
+        call(&r, "commission_on_network",
+            json!({"setup_pin_code": 20202021, "ip_addr": "192.168.1.99"})).await.unwrap();
+        assert!(r.stack.calls().iter().any(|c| c.contains("address") && c.contains("addr=192.168.1.99:5540")));
+    }
+
+    #[tokio::test]
+    async fn commission_on_network_link_local_ip_falls_back_to_on_network() {
+        let r = rig();
+        *r.stack.commission_response.lock().unwrap() =
+            Some(Ok(CommissionOutcome { device_fabric_index: 1, address: "192.168.1.50:5540".into() }));
+        call(&r, "commission_on_network",
+            json!({"setup_pin_code": 20202021, "ip_addr": "fe80::1"})).await.unwrap();
+        assert!(r.stack.calls().iter().any(|c| c.contains("onnetwork")));
+    }
+
+    #[tokio::test]
+    async fn commission_on_network_long_discriminator_filter_reaches_stack() {
+        let r = rig();
+        *r.stack.commission_response.lock().unwrap() =
+            Some(Ok(CommissionOutcome { device_fabric_index: 1, address: "192.168.1.50:5540".into() }));
+        call(&r, "commission_on_network",
+            json!({"setup_pin_code": 20202021, "filter_type": 2, "filter": 3840})).await.unwrap();
+        assert!(r.stack.calls().iter().any(|c| c.contains("onnetwork") && c.contains("long=Some(3840)")));
     }
 
     #[tokio::test]

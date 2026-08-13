@@ -76,6 +76,20 @@ impl MatterController {
 
     pub(crate) fn config_snapshot(&self) -> ConfigData { self.config.lock().unwrap().clone() }
 
+    /// Clone-mutate-save-writeback the config under the std Mutex, never
+    /// holding the lock across an await (this helper is fully sync; callers
+    /// invoke it between awaits). `f` may return a value derived from the
+    /// mutation (e.g. an allocated node id).
+    pub(crate) fn update_config<R>(&self, f: impl FnOnce(&mut ConfigData) -> R) -> R {
+        let mut cfg = self.config.lock().unwrap().clone();
+        let result = f(&mut cfg);
+        if let Err(e) = self.storage.save_config(&cfg) {
+            tracing::error!("persist config: {e}");
+        }
+        *self.config.lock().unwrap() = cfg;
+        result
+    }
+
     pub(crate) fn ensure_node(&self, node_id: u64) -> Result<(), CommandError> {
         if self.registry.contains(node_id) { Ok(()) } else {
             Err(CommandError::new(ServerErrorCode::NodeNotExists, format!("Node {node_id} does not exist")))

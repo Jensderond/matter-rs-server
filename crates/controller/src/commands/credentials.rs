@@ -14,7 +14,7 @@ pub async fn set_wifi(c: &MatterController, args: &Map<String, Value>) -> Result
     let credentials = opt_str(args, "credentials").unwrap_or("").to_string();
     let id = opt_str(args, "id").unwrap_or("default").to_string();
 
-    let mut cfg = c.config.lock().unwrap().clone();
+    let cfg = c.config_snapshot();
     validate_credential_id(&id, cfg.wifi_credentials.keys().cloned()).map_err(invalid)?;
 
     let password = if credentials.is_empty() {
@@ -29,11 +29,7 @@ pub async fn set_wifi(c: &MatterController, args: &Map<String, Value>) -> Result
     } else {
         credentials
     };
-    cfg.wifi_credentials.insert(id, WifiCredential { ssid, password });
-    if let Err(e) = c.storage.save_config(&cfg) {
-        tracing::error!("persist config: {e}");
-    }
-    *c.config.lock().unwrap() = cfg;
+    c.update_config(|cfg| { cfg.wifi_credentials.insert(id, WifiCredential { ssid, password }); });
     c.broadcast_server_info_updated();
     Ok(json!({}))
 }
@@ -43,37 +39,23 @@ pub async fn set_thread(c: &MatterController, args: &Map<String, Value>) -> Resu
     validate_thread_dataset(&dataset).map_err(invalid)?;
     let id = opt_str(args, "id").unwrap_or("default").to_string();
 
-    let mut cfg = c.config.lock().unwrap().clone();
+    let cfg = c.config_snapshot();
     validate_credential_id(&id, cfg.thread_datasets.keys().cloned()).map_err(invalid)?;
-    cfg.thread_datasets.insert(id, dataset);
-    if let Err(e) = c.storage.save_config(&cfg) {
-        tracing::error!("persist config: {e}");
-    }
-    *c.config.lock().unwrap() = cfg;
+    c.update_config(|cfg| { cfg.thread_datasets.insert(id, dataset); });
     c.broadcast_server_info_updated();
     Ok(json!({}))
 }
 
 pub async fn remove_wifi(c: &MatterController, args: &Map<String, Value>) -> Result<Value, CommandError> {
     let id = opt_str(args, "id").unwrap_or("default").to_string();
-    let mut cfg = c.config.lock().unwrap().clone();
-    cfg.wifi_credentials.remove(&id);
-    if let Err(e) = c.storage.save_config(&cfg) {
-        tracing::error!("persist config: {e}");
-    }
-    *c.config.lock().unwrap() = cfg;
+    c.update_config(|cfg| { cfg.wifi_credentials.remove(&id); });
     c.broadcast_server_info_updated();
     Ok(json!({}))
 }
 
 pub async fn remove_thread(c: &MatterController, args: &Map<String, Value>) -> Result<Value, CommandError> {
     let id = opt_str(args, "id").unwrap_or("default").to_string();
-    let mut cfg = c.config.lock().unwrap().clone();
-    cfg.thread_datasets.remove(&id);
-    if let Err(e) = c.storage.save_config(&cfg) {
-        tracing::error!("persist config: {e}");
-    }
-    *c.config.lock().unwrap() = cfg;
+    c.update_config(|cfg| { cfg.thread_datasets.remove(&id); });
     c.broadcast_server_info_updated();
     Ok(json!({}))
 }
