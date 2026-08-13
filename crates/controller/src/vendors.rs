@@ -7,6 +7,7 @@
 //! Distributed Compliance Ledger (DCL) service (DCL wins on conflict); we
 //! don't have a DCL client here, so that live-merge behavior is out of scope
 //! for v1 and this static table is used as-is.
+// TODO(plan3): merge live DCL vendor data like the Node server
 pub static VENDORS: &[(u16, &str)] = &[
     (0, "[Matter Standard]"),
     (1, "Panasonic"),
@@ -1264,4 +1265,32 @@ pub fn name(vendor_id: u16) -> Option<&'static str> {
 
 /// The full vendor id -> name table, sorted by id.
 pub fn all() -> &'static [(u16, &'static str)] { VENDORS }
+
+#[cfg(test)]
+mod tests {
+    use super::VENDORS;
+
+    /// `name()`'s binary_search_by_key depends on VENDORS being strictly
+    /// ascending by id (which also rules out duplicate ids). The table was
+    /// script-generated from VendorIDs.ts; a future regeneration or hand-edit
+    /// could silently corrupt this invariant with no other test catching it.
+    #[test]
+    fn table_is_strictly_ascending_by_id() {
+        assert!(
+            VENDORS.windows(2).all(|w| w[0].0 < w[1].0),
+            "VENDORS must be strictly ascending by id (also rules out duplicates)"
+        );
+    }
+
+    /// Guards against an accidental truncation of the ported table (e.g. a
+    /// bad regex, a truncated paste) going unnoticed.
+    #[test]
+    fn table_has_expected_entry_count() {
+        assert!(
+            VENDORS.len() >= 1000,
+            "VENDORS has only {} entries, expected >= 1000 (full CSA table)",
+            VENDORS.len()
+        );
+    }
+}
 
