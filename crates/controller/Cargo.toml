@@ -11,7 +11,7 @@ serde_json.workspace = true
 chrono = "0.4"
 base64 = "0.22"
 tracing.workspace = true
-tokio = { version = "1", features = ["sync", "rt", "time"] }
+tokio = { version = "1", features = ["sync", "rt", "time", "process"] }
 async-trait.workspace = true
 
 [dev-dependencies]
