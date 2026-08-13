@@ -76,9 +76,28 @@ impl Storage {
 
     pub fn root(&self) -> &Path { &self.root }
 
-    pub fn load_identity(&self) -> Option<ServerIdentity> {
-        read_json(&self.root.join("server.json"))
+    /// Three-state on purpose: `Ok(None)` ONLY when server.json does not exist.
+    /// An unreadable or unparseable file is an `Err`, never `None` — a caller
+    /// that read "no identity yet" out of a corrupt file would mint a new
+    /// fabric and rename over key material that is still recoverable by hand,
+    /// orphaning every commissioned node.
+    pub fn load_identity(&self) -> io::Result<Option<ServerIdentity>> {
+        read_json_strict(&self.root.join("server.json"))
     }
+    /// First write of the identity. Refuses to clobber an existing file, so a
+    /// logic slip upstream stays recoverable instead of destroying the CA key.
+    pub fn create_identity(&self, id: &ServerIdentity) -> io::Result<()> {
+        let path = self.root.join("server.json");
+        if path.try_exists()? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("refusing to overwrite existing {path:?} with a freshly generated identity"),
+            ));
+        }
+        write_json_atomic(&path, id, true)
+    }
+    /// Rewrite an identity that is already on disk (corrections to derived
+    /// fields). Use `create_identity` for the first write.
     pub fn save_identity(&self, id: &ServerIdentity) -> io::Result<()> {
         write_json_atomic(&self.root.join("server.json"), id, true)
     }
@@ -110,6 +129,23 @@ impl Storage {
         let p = self.root.join("nodes").join(format!("{node_id}.json"));
         if p.exists() { std::fs::remove_file(p) } else { Ok(()) }
     }
+}
+
+/// Strict counterpart of `read_json` for files whose absence and whose
+/// corruption mean very different things. Deliberately NOT used by
+/// `load_config` (missing -> defaults) or `load_nodes` (one bad node file must
+/// not block startup); both of those want the lenient version.
+fn read_json_strict<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+    // Also catches non-UTF-8 (InvalidData), a directory in place of the file,
+    // and permission errors — none of which are "not configured yet".
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    serde_json::from_str(&data)
+        .map(Some)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{path:?}: {e}")))
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
@@ -204,7 +240,7 @@ mod tests {
     fn identity_roundtrip_and_0600() {
         let d = tmp();
         let s = Storage::open(d.path()).unwrap();
-        assert!(s.load_identity().is_none());
+        assert!(s.load_identity().unwrap().is_none());
         let id = ServerIdentity {
             fabric_id: 1, vendor_id: 0xFFF1, controller_node_id: 112233,
             compressed_fabric_id: 0xDEADBEEF,
@@ -213,7 +249,7 @@ mod tests {
             ipk: vec![5; 16],
         };
         s.save_identity(&id).unwrap();
-        let back = s.load_identity().unwrap();
+        let back = s.load_identity().unwrap().unwrap();
         assert_eq!(back.compressed_fabric_id, 0xDEADBEEF);
         assert_eq!(back.ipk, vec![5; 16]);
         #[cfg(unix)]
@@ -225,6 +261,46 @@ mod tests {
         // key material is base64 in the file, not JSON arrays
         let raw = std::fs::read_to_string(d.path().join("server.json")).unwrap();
         assert!(!raw.contains("[1,1,1"));
+    }
+
+    /// Corruption must never read back as "no identity yet", while config and
+    /// node files must stay lenient (defaults / skip-one-file).
+    #[test]
+    fn identity_load_is_strict_config_and_nodes_stay_lenient() {
+        let d = tmp();
+        let s = Storage::open(d.path()).unwrap();
+        let server = d.path().join("server.json");
+
+        assert!(s.load_identity().unwrap().is_none()); // absent -> None
+
+        std::fs::write(&server, b"{ not json").unwrap();
+        assert_eq!(s.load_identity().unwrap_err().kind(), io::ErrorKind::InvalidData);
+
+        std::fs::write(&server, [0x80, 0x81]).unwrap(); // not UTF-8
+        assert!(s.load_identity().is_err());
+
+        // Missing field: ServerIdentity has no serde defaults, so this fails
+        // the whole parse - and that must surface, not vanish.
+        std::fs::write(&server, br#"{"fabric_id":1}"#).unwrap();
+        assert!(s.load_identity().is_err());
+
+        // create_identity never clobbers.
+        let id = ServerIdentity {
+            fabric_id: 1, vendor_id: 0xFFF1, controller_node_id: 112233,
+            compressed_fabric_id: 7, ca_private_key: vec![1; 32], rcac_tlv: vec![2; 40],
+            controller_private_key: vec![3; 32], controller_noc_tlv: vec![4; 40], ipk: vec![5; 16],
+        };
+        let before = std::fs::read(&server).unwrap();
+        assert_eq!(s.create_identity(&id).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&server).unwrap(), before);
+        std::fs::remove_file(&server).unwrap();
+        s.create_identity(&id).unwrap();
+        assert_eq!(s.load_identity().unwrap().unwrap().compressed_fabric_id, 7);
+
+        std::fs::write(d.path().join("config.json"), b"{ not json").unwrap();
+        assert_eq!(s.load_config().fabric_label, ConfigData::default().fabric_label);
+        std::fs::write(d.path().join("nodes").join("9.json"), b"{ not json").unwrap();
+        assert!(s.load_nodes().is_empty());
     }
 
     #[test]

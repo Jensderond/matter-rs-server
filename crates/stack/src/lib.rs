@@ -3,4 +3,5 @@
 //! through `StackHandle` (Task 16) which implements
 //! `matter_rs_controller::stack_api::Stack`.
 
+pub mod identity;
 pub mod tlv_json;
