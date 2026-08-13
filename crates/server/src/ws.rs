@@ -10,7 +10,10 @@
 //!    this against Node fixtures.
 //! 4. `start_listening` additionally flips the connection into listening
 //!    mode; controller events are forwarded as `{"event","data"}` frames
-//!    only while listening, dropped otherwise.
+//!    only while listening, dropped otherwise. Because the events receiver
+//!    is subscribed at connect time, any events published before
+//!    `start_listening` succeeds are drained (discarded) at that point, so
+//!    the subscription effectively begins at `start_listening`.
 //! 5. A `true` on the shared shutdown watch (or the sender being dropped)
 //!    sends a `{"event":"server_shutdown","data":null}` frame and closes
 //!    the connection, regardless of listening state.
@@ -49,7 +52,13 @@ async fn handle_connection(mut socket: WebSocket, state: AppState) {
             msg = socket.recv() => {
                 let Some(Ok(msg)) = msg else { return };
                 let Message::Text(text) = msg else { continue };
-                let frame = handle_text_frame(&state, &text, &mut listening).await;
+                let (frame, started_listening) = handle_text_frame(&state, &text, &mut listening).await;
+                if started_listening {
+                    // The events receiver subscribed at connect time; drain
+                    // anything queued before this start_listening so events
+                    // only flow from this point forward.
+                    while events.try_recv().is_ok() {}
+                }
                 if socket.send(Message::Text(frame.into())).await.is_err() { return; }
             }
             ev = events.recv() => {
@@ -76,21 +85,26 @@ async fn handle_connection(mut socket: WebSocket, state: AppState) {
     }
 }
 
-async fn handle_text_frame(state: &AppState, text: &str, listening: &mut bool) -> String {
+/// Handles one inbound text frame, returning the reply frame and whether
+/// this call just flipped `listening` from false to true (i.e. a
+/// successful `start_listening`), so the caller can drain any events
+/// queued on the broadcast receiver before this point.
+async fn handle_text_frame(state: &AppState, text: &str, listening: &mut bool) -> (String, bool) {
     let cmd: CommandMessage = match serde_json::from_str(text) {
         Ok(c) => c,
         Err(e) => {
-            return serde_json::to_string(&ErrorResult::new(
+            return (serde_json::to_string(&ErrorResult::new(
                 String::new(), ServerErrorCode::InvalidArguments, e.to_string(),
-            )).unwrap();
+            )).unwrap(), false);
         }
     };
     let is_start_listening = cmd.command == "start_listening";
     match state.controller.handle_command(&cmd).await {
         Ok(result) => {
+            let started_listening = is_start_listening && !*listening;
             if is_start_listening { *listening = true; }
-            serde_json::to_string(&SuccessResult { message_id: cmd.message_id, result }).unwrap()
+            (serde_json::to_string(&SuccessResult { message_id: cmd.message_id, result }).unwrap(), started_listening)
         }
-        Err(e) => serde_json::to_string(&ErrorResult::new(cmd.message_id, e.code, e.details)).unwrap(),
+        Err(e) => (serde_json::to_string(&ErrorResult::new(cmd.message_id, e.code, e.details)).unwrap(), false),
     }
 }
