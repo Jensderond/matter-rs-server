@@ -100,6 +100,13 @@ impl MatterController {
             controller_node_id: Some(self.identity.controller_node_id),
         }
     }
+
+    pub(crate) fn broadcast_server_info_updated(&self) {
+        let _ = self.events.send(matter_rs_wire::envelope::EventMessage {
+            event: "server_info_updated".into(),
+            data: serde_json::to_value(self.build_server_info()).unwrap(),
+        });
+    }
 }
 
 #[async_trait::async_trait]
@@ -122,12 +129,25 @@ impl Controller for MatterController {
             "read_attribute" => commands::interaction::read_attribute(self, args).await,
             "write_attribute" => commands::interaction::write_attribute(self, args).await,
             "device_command" => commands::interaction::device_command(self, args).await,
-            // Tasks 9-11 extend this match. The catch-all stays last.
+            "commission_with_code" => commands::commissioning::commission_with_code(self, args).await,
+            "commission_on_network" => commands::commissioning::commission_on_network(self, args).await,
+            "open_commissioning_window" => commands::commissioning::open_commissioning_window(self, args).await,
+            "discover" | "discover_commissionable_nodes" => commands::commissioning::discover(self, args).await,
+            "set_wifi_credentials" => commands::credentials::set_wifi(self, args).await,
+            "set_thread_dataset" => commands::credentials::set_thread(self, args).await,
+            "remove_wifi_credentials" => commands::credentials::remove_wifi(self, args).await,
+            "remove_thread_dataset" => commands::credentials::remove_thread(self, args).await,
+            "get_all_credentials" => commands::credentials::get_all(self, args).await,
+            "set_default_fabric_label" => commands::fabrics::set_default_fabric_label(self, conn, args).await,
+            "get_fabric_label" => commands::fabrics::get_fabric_label(self, args).await,
+            "get_matter_fabrics" => commands::fabrics::get_matter_fabrics(self, args).await,
+            "remove_matter_fabric" => commands::fabrics::remove_matter_fabric(self, args).await,
+            "set_acl_entry" => commands::fabrics::set_acl_entry(self, args).await,
+            "set_node_binding" => commands::fabrics::set_node_binding(self, args).await,
+            // Task 11 extends this match (icd, ota, etc). The catch-all stays last.
             other => Err(CommandError::new(
                 ServerErrorCode::InvalidCommand, format!("Unknown command: {other}"))),
         }
-        // `conn` is used by set_default_fabric_label (Task 10).
-        .map_err(|e| { let _ = conn; e })
     }
 
     fn connection_closed(&self, conn: ConnId) {

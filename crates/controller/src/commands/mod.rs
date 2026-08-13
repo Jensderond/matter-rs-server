@@ -1,5 +1,8 @@
 //! Arg-parsing helpers shared by all command family modules.
 
+pub mod commissioning;
+pub mod credentials;
+pub mod fabrics;
 pub mod interaction;
 pub mod nodes;
 

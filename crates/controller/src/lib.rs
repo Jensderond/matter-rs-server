@@ -6,3 +6,4 @@ pub mod registry;
 pub mod node_manager;
 pub mod real;
 pub mod commands;
+pub mod vendors;
