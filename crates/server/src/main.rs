@@ -12,12 +12,17 @@ async fn main() {
     logging::init(&config);
     config.warn_ignored();
 
-    // Storage dir now (plan 2 stores fabric data in it).
+    // Storage dir now (plan 2 stores fabric data in it). Only chmod 0700 when
+    // we're the ones creating it — an existing dir keeps whatever permissions
+    // it already has.
+    let storage_dir_existed = config.storage_path.exists();
     std::fs::create_dir_all(&config.storage_path).expect("cannot create --storage-path");
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&config.storage_path, std::fs::Permissions::from_mode(0o700));
+        if !storage_dir_existed {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&config.storage_path, std::fs::Permissions::from_mode(0o700));
+        }
     }
 
     // Plan 1: stub controller. Plan 2 replaces this with the rs-matter one.
@@ -59,10 +64,12 @@ async fn main() {
         let router = router.clone();
         let mut rx = shutdown_tx.subscribe();
         servers.spawn(async move {
-            axum::serve(listener, router)
+            if let Err(e) = axum::serve(listener, router)
                 .with_graceful_shutdown(async move { let _ = rx.changed().await; })
                 .await
-                .unwrap();
+            {
+                tracing::error!("listener error: {e}");
+            }
         });
     }
 
@@ -75,6 +82,10 @@ async fn main() {
     tracing::info!("shutting down");
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while servers.join_next().await.is_some() {}
+        while let Some(res) = servers.join_next().await {
+            if let Err(e) = res {
+                tracing::error!("listener task failed: {e}");
+            }
+        }
     }).await;
 }
