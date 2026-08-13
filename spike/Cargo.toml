@@ -19,6 +19,6 @@ static_cell = "1"
 if-addrs = "0.15"
 async-io = "2"
 futures-lite = "2"
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 rand = { version = "0.8", features = ["std", "std_rng"] }
 rs-matter = { git = "https://github.com/project-chip/rs-matter", rev = "03bc8f2aeb7765a93e7863e2263f73c7bbc3d401", features = ["async-io", "max-sessions-32"] }

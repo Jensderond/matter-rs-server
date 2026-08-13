@@ -18,6 +18,28 @@ pub async fn run_builtin_mdns<C: Crypto>(matter: &Matter<'_>, crypto: C) -> Resu
         let all = if_addrs::get_if_addrs().map_err(|_| ErrorCode::StdIoError)?;
         debug!("Available network interfaces: {:?}", all);
 
+        // `SPIKE_IFACE=en0` forces the interface (the auto-pick heuristic can
+        // land on a VM/Docker bridge on hosts that have them).
+        if let Ok(forced) = std::env::var("SPIKE_IFACE") {
+            let v4 = all.iter().find_map(|ia| match ia.addr {
+                if_addrs::IfAddr::V4(ref v4) if ia.name == forced => {
+                    Some((v4.ip, ia.index.unwrap_or(0)))
+                }
+                _ => None,
+            });
+            let v6 = all.iter().find_map(|ia| match ia.addr {
+                if_addrs::IfAddr::V6(ref v6) if ia.name == forced => Some(v6.ip),
+                _ => None,
+            });
+            let (ipv4, index) = v4.ok_or_else(|| {
+                error!("SPIKE_IFACE={forced} not found or has no IPv4 address");
+                ErrorCode::StdIoError
+            })?;
+            let ipv6 = v6.unwrap_or(std::net::Ipv6Addr::UNSPECIFIED);
+            info!("Forced network interface {forced} with {ipv4}/{ipv6} for mDNS");
+            return Ok((ipv4.octets().into(), ipv6.octets().into(), index));
+        }
+
         // Pick an interface with both an IPv6 address and a non-loopback IPv4
         // address; prefer link-local IPv6 (most likely the real LAN interface,
         // as opposed to docker/virtual interfaces which are typically v4-only).
@@ -88,16 +110,27 @@ pub async fn run_builtin_mdns<C: Crypto>(matter: &Matter<'_>, crypto: C) -> Resu
 
     let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
+    // Share port 5353 with a system mDNS daemon (macOS mDNSResponder, avahi).
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
     socket.set_only_v6(false)?;
     socket.bind(&MDNS_SOCKET_DEFAULT_BIND_ADDR.into())?;
     let socket = async_io::Async::<UdpSocket>::new_nonblocking(socket.into())?;
 
-    socket
+    // Tolerate partial multicast setup (e.g. no IPv6 on the interface, or an
+    // odd container/VM network): one working family is enough to discover.
+    if let Err(e) = socket
         .get_ref()
-        .join_multicast_v6(&MDNS_IPV6_BROADCAST_ADDR, interface)?;
-    socket
+        .join_multicast_v6(&MDNS_IPV6_BROADCAST_ADDR, interface)
+    {
+        warn!("join_multicast_v6 on ifindex {interface} failed: {e}");
+    }
+    if let Err(e) = socket
         .get_ref()
-        .join_multicast_v4(&MDNS_IPV4_BROADCAST_ADDR, &ipv4_addr)?;
+        .join_multicast_v4(&MDNS_IPV4_BROADCAST_ADDR, &ipv4_addr)
+    {
+        warn!("join_multicast_v4 on {ipv4_addr} failed: {e}");
+    }
 
     BuiltinMdns::new()
         .run(

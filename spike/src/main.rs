@@ -235,14 +235,25 @@ async fn commission<C: Crypto>(
     info!("=== Commissioner::commission (phase 1 — PASE + over PASE) ===");
 
     // Offline CA chain: RCAC then ICAC; RCAC priv key discarded immediately.
+    // SPIKE_NO_ICAC=1 switches to RCAC-direct mode (NOCs signed by the RCAC,
+    // no intermediate) — used to isolate ICAC-specific interop failures.
+    let no_icac = std::env::var("SPIKE_NO_ICAC").is_ok_and(|v| v == "1");
+
     let mut rcac_buf = [0u8; MAX_CERT_TLV_AND_ASN1_LEN];
     let mut rcac_gen = RcacGenerator::new(&mut rcac_buf);
     let (rcac_priv, rcac) = rcac_gen.generate(crypto, FABRIC_ID, VALID_FOREVER)?;
 
     let mut icac_buf = [0u8; MAX_CERT_TLV_AND_ASN1_LEN];
     let mut icac_gen = IcacGenerator::new(&mut icac_buf);
-    let (icac_priv, icac) = icac_gen.generate(crypto, rcac_priv.reference(), rcac, VALID_FOREVER)?;
-    drop(rcac_priv);
+    let (signing_priv, icac): (_, &[u8]) = if no_icac {
+        info!("RCAC-direct mode: no ICAC, NOCs signed by the RCAC");
+        (rcac_priv, &[])
+    } else {
+        let (icac_priv, icac) =
+            icac_gen.generate(crypto, rcac_priv.reference(), rcac, VALID_FOREVER)?;
+        drop(rcac_priv);
+        (icac_priv, icac)
+    };
 
     // Controller operational keypair + CSR + NOC.
     let controller_secret_key = crypto.generate_secret_key()?;
@@ -252,7 +263,8 @@ async fn commission<C: Crypto>(
     controller_secret_key.write_canon(&mut controller_secret_key_canon)?;
 
     let mut noc_buf = [0u8; MAX_CERT_TLV_AND_ASN1_LEN];
-    let mut noc_generator = NocGenerator::create(icac_priv.reference(), rcac, icac, &mut noc_buf)?;
+    let mut noc_generator =
+        NocGenerator::create(signing_priv.reference(), rcac, icac, &mut noc_buf)?;
 
     let controller_noc = noc_generator.generate(
         crypto,
