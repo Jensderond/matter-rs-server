@@ -102,4 +102,34 @@ mod tests {
         assert_eq!(e.name, "StartUp");
         assert!(e.fields.iter().any(|f| f.name == "softwareVersion"));
     }
+
+    #[test]
+    fn access_control_event_with_access_clause_and_all_events_survive() {
+        // AccessControl's events are declared as
+        // "fabric_sensitive info event access(read: administer) Name = N {"
+        // -- qualifiers *and* an access(...) clause between "event" and the
+        // name/code. A parser that only handles "critical event Name = N {"
+        // fails to open this event's block, and its closing "}" then gets
+        // misread as the cluster's closing brace, truncating the rest of
+        // the cluster (the remaining 3 events, later attributes, structs,
+        // and the ReviewFabricRestrictions command all silently vanish).
+        let c = cluster(31).expect("AccessControl");
+        assert_eq!(c.events.len(), 4, "all 4 AccessControl events must survive parsing");
+
+        let e = c.event(0).expect("AccessControlEntryChanged");
+        assert_eq!(e.name, "AccessControlEntryChanged");
+        // adminNodeID=1, adminPasscodeID=2, changeType=3, latestValue=4, fabricIndex=254
+        assert_eq!(e.fields.len(), 5);
+        assert!(e.fields.iter().any(|f| f.name == "adminNodeID" && f.code == 1));
+        assert!(e.fields.iter().any(|f| f.name == "adminPasscodeID" && f.code == 2));
+        assert!(e.fields.iter().any(|f| f.name == "changeType" && f.code == 3));
+        assert!(e.fields.iter().any(|f| f.name == "latestValue" && f.code == 4));
+        // Also guards the separate "fabric_idx is a type, not a qualifier" fix:
+        // this field would be dropped entirely if fabric_idx were stripped.
+        assert!(e.fields.iter().any(|f| f.name == "fabricIndex" && f.code == 254 && f.ty == "fabric_idx"));
+
+        // The cluster body continues past this event: its command must
+        // still be present, proving the cluster wasn't closed early.
+        assert!(c.find_command_ci("reviewFabricRestrictions").is_some());
+    }
 }
