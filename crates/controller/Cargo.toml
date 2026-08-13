@@ -6,7 +6,14 @@ license.workspace = true
 
 [dependencies]
 matter-rs-wire = { path = "../wire" }
+serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
-tokio = { version = "1", features = ["sync", "rt", "macros"] }
+chrono = "0.4"
+base64 = "0.22"
+tracing.workspace = true
+tokio = { version = "1", features = ["sync", "rt", "time"] }
 async-trait.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "rt", "macros"] }
+tempfile = "3"
