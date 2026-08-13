@@ -70,6 +70,17 @@ commissioning path should surface this distinctly.
   invoke) compiled against the pinned rev **first try** — the commissioner API
   surface documented in the design holds.
 
+## Leg 1.5 — same virtual device, on the deployment platform (2026-08-13)
+
+Repeated on CT 110 (`dev-jensderond`): Debian 13 amd64, unprivileged Proxmox
+LXC, bridged `eth0` — i.e. the exact target environment. `SPIKE_IFACE=eth0
+SPIKE_NO_ICAC=1`, device + spike both on the box.
+
+Identical full pass: discovery (link-local IPv6, sub-second) → PASE → AddNOC
+→ CASE → reads → toggle, ~2 s end-to-end, exit 0. Validates LXC mDNS
+multicast + link-local UDP alongside the protocol flow. Debug build compiles
+in ~3 min warm / ~30 min cold on the container.
+
 ## Leg 2 — real devices (pending)
 
 Blocked on: dev machine tailnet connectivity + a pairing code from HA
