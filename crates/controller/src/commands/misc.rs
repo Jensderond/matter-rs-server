@@ -75,8 +75,11 @@ mod tests {
         let r = rig();
         let v = call(&r, "get_vendor_names", json!({})).await.unwrap();
         assert_eq!(v["4476"], "IKEA of Sweden");
-        let v = call(&r, "get_vendor_names", json!({"filter_vendors": [4476, 1]})).await.unwrap();
+        // 39321 is verified absent from the full vendor table (see vendors.rs);
+        // it stands in for "some unknown id" and must be silently omitted.
+        let v = call(&r, "get_vendor_names", json!({"filter_vendors": [4476, 39321]})).await.unwrap();
         assert_eq!(v.as_object().unwrap().len(), 1);
+        assert_eq!(v["4476"], "IKEA of Sweden");
     }
 
     #[tokio::test]
