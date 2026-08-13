@@ -1,0 +1,25 @@
+[package]
+name = "matter-rs-stack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+matter-rs-controller = { path = "../controller" }
+matter-rs-gen = { path = "../gen" }
+rs-matter = { git = "https://github.com/project-chip/rs-matter", rev = "03bc8f2aeb7765a93e7863e2263f73c7bbc3d401", features = ["async-io", "max-sessions-32", "case-resumption"] }
+embassy-futures = "0.1"
+embassy-time = { version = "0.5", features = ["std"] }
+embassy-time-queue-utils = { version = "0.3", features = ["generic-queue-64"] }
+async-executor = "1"
+async-io = "2"
+futures-lite = "2"
+static_cell = "1"
+socket2 = { version = "0.5", features = ["all"] }
+if-addrs = "0.15"
+rand = { version = "0.8", features = ["std", "std_rng"] }
+base64 = "0.22"
+serde_json.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tokio = { version = "1", features = ["sync", "rt"] }
