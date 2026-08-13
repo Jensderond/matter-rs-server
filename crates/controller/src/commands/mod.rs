@@ -1,5 +1,6 @@
 //! Arg-parsing helpers shared by all command family modules.
 
+pub mod interaction;
 pub mod nodes;
 
 use serde_json::{Map, Value};

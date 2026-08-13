@@ -119,6 +119,9 @@ impl Controller for MatterController {
             "remove_node" => commands::nodes::remove_node(self, args).await,
             "ping_node" => commands::nodes::ping_node(self, args).await,
             "get_node_ip_addresses" => commands::nodes::get_node_ip_addresses(self, args).await,
+            "read_attribute" => commands::interaction::read_attribute(self, args).await,
+            "write_attribute" => commands::interaction::write_attribute(self, args).await,
+            "device_command" => commands::interaction::device_command(self, args).await,
             // Tasks 9-11 extend this match. The catch-all stays last.
             other => Err(CommandError::new(
                 ServerErrorCode::InvalidCommand, format!("Unknown command: {other}"))),
