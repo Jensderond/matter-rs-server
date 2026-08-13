@@ -2,6 +2,10 @@ use matter_rs_wire::envelope::{CommandMessage, EventMessage};
 use matter_rs_wire::error::ServerErrorCode;
 use matter_rs_wire::server_info::ServerInfoMessage;
 
+/// Identifies one WS connection for the lifetime of the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConnId(pub u64);
+
 #[derive(Debug)]
 pub struct CommandError {
     pub code: ServerErrorCode,
@@ -18,7 +22,9 @@ impl CommandError {
 pub trait Controller: Send + Sync + 'static {
     fn server_info(&self) -> ServerInfoMessage;
     fn node_count(&self) -> usize;
-    async fn handle_command(&self, cmd: &CommandMessage) -> Result<serde_json::Value, CommandError>;
+    async fn handle_command(&self, conn: ConnId, cmd: &CommandMessage) -> Result<serde_json::Value, CommandError>;
+    /// Called exactly once when a connection closes (any reason). Default no-op.
+    fn connection_closed(&self, _conn: ConnId) {}
     /// Subscribes to the controller's event broadcast stream.
     ///
     /// Implementations must own their broadcast `Sender` for the entire

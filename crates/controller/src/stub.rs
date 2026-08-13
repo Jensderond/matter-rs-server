@@ -5,7 +5,7 @@ use matter_rs_wire::envelope::{CommandMessage, EventMessage};
 use matter_rs_wire::error::ServerErrorCode;
 use matter_rs_wire::server_info::ServerInfoMessage;
 
-use crate::api::{CommandError, Controller};
+use crate::api::{CommandError, ConnId, Controller};
 
 /// Protocol-skeleton stand-in: real shapes for session commands, honest
 /// errors for the rest. Replaced by the rs-matter-backed controller in plan 2.
@@ -35,7 +35,7 @@ impl Controller for StubController {
         0
     }
 
-    async fn handle_command(&self, cmd: &CommandMessage) -> Result<Value, CommandError> {
+    async fn handle_command(&self, _conn: ConnId, cmd: &CommandMessage) -> Result<Value, CommandError> {
         match cmd.command.as_str() {
             "server_info" => Ok(serde_json::to_value(self.server_info()).unwrap()),
             "start_listening" | "get_nodes" => Ok(json!([])),
@@ -94,11 +94,11 @@ mod tests {
     #[tokio::test]
     async fn known_read_commands_return_empty_shapes() {
         let c = StubController::new(test_info());
-        assert_eq!(c.handle_command(&cmd("get_nodes")).await.unwrap(), json!([]));
-        assert_eq!(c.handle_command(&cmd("start_listening")).await.unwrap(), json!([]));
-        let si = c.handle_command(&cmd("server_info")).await.unwrap();
+        assert_eq!(c.handle_command(ConnId(1), &cmd("get_nodes")).await.unwrap(), json!([]));
+        assert_eq!(c.handle_command(ConnId(1), &cmd("start_listening")).await.unwrap(), json!([]));
+        let si = c.handle_command(ConnId(1), &cmd("server_info")).await.unwrap();
         assert_eq!(si["schema_version"], 13);
-        let diag = c.handle_command(&cmd("diagnostics")).await.unwrap();
+        let diag = c.handle_command(ConnId(1), &cmd("diagnostics")).await.unwrap();
         assert_eq!(diag["nodes"], json!([]));
         assert_eq!(diag["events"], json!([]));
     }
@@ -106,14 +106,14 @@ mod tests {
     #[tokio::test]
     async fn get_node_returns_node_not_exists() {
         let c = StubController::new(test_info());
-        let err = c.handle_command(&cmd("get_node")).await.unwrap_err();
+        let err = c.handle_command(ConnId(1), &cmd("get_node")).await.unwrap_err();
         assert_eq!(err.code.code(), 5);
     }
 
     #[tokio::test]
     async fn unknown_command_returns_invalid_command() {
         let c = StubController::new(test_info());
-        let err = c.handle_command(&cmd("frobnicate")).await.unwrap_err();
+        let err = c.handle_command(ConnId(1), &cmd("frobnicate")).await.unwrap_err();
         assert_eq!(err.code.code(), 9);
     }
 
