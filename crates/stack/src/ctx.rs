@@ -7,12 +7,6 @@
 //! enforces at the cost of keeping every borrow short (never across an
 //! `.await`).
 
-// TODO(task16): remove — Task 15 (commissioning/window/fabrics/discovery) and
-// Task 16 (runtime, supervisor, StackHandle) are the consumers of most of this.
-// While this is here it also suppresses genuine dead-code findings, e.g. an
-// `addrs` map that never gets a writer.
-#![allow(dead_code)]
-
 use core::future::Future;
 use core::num::NonZeroU8;
 use core::pin::pin;
@@ -69,11 +63,25 @@ pub(crate) struct StackCtx<C: Crypto> {
     pub last_event: RefCell<HashMap<u64, u64>>,
     /// node_id -> last known addresses ("ip" strings, most recent first)
     pub addrs: RefCell<HashMap<u64, Vec<String>>>,
-    /// node_id -> supervisor task (dropping cancels)
+    /// node_id -> supervisor task (dropping cancels).
+    ///
+    /// **Cleanup contract for `stop_supervisor` (Task 16).** Dropping the task
+    /// releases the two *subscription-lifetime* maps by itself — the supervisor
+    /// holds a guard over `subs` and `liveness` (`supervisor::SubscriptionGuard`),
+    /// so cancelling it mid-await cannot leak either. The two *node-lifetime*
+    /// caches are not covered and must be cleared by whoever removes the entry
+    /// here:
+    ///
+    /// - `last_event`, or a node re-commissioned under the same id inherits the
+    ///   old high-water mark and drops its first events;
+    /// - `addrs`, or `node_addresses` keeps answering for a node that is gone.
     pub supervisors: RefCell<HashMap<u64, async_executor::Task<()>>>,
 }
 
 impl<C: Crypto> StackCtx<C> {
+    // TODO(task16): remove the allow — the runtime thread is what builds the
+    // context; everything else here already has callers.
+    #[allow(dead_code)]
     pub fn new(
         matter: &'static Matter<'static>,
         crypto: C,

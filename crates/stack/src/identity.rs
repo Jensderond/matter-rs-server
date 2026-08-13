@@ -32,7 +32,7 @@ pub const CONTROLLER_NODE_ID: u64 = 112233;
 
 /// `Fabric::label` is a `heapless::String<32>` — 32 *bytes*, where the stored
 /// label is capped at 32 *chars* (Node-compatible, deliberately).
-const FABRIC_LABEL_MAX_BYTES: usize = 32;
+pub(crate) const FABRIC_LABEL_MAX_BYTES: usize = 32;
 
 /// Load-or-generate the controller identity and install it as a fabric on the
 /// Matter instance. Returns the identity — freshly written to `server.json` on
@@ -153,7 +153,11 @@ fn install<C: Crypto>(
 }
 
 /// Longest prefix of `s` that fits in `max_bytes` without splitting a char.
-fn truncate_to_bytes(s: &str, max_bytes: usize) -> &str {
+///
+/// Shared with `ops::fabrics::update_fabric_label`, which has to clamp for the
+/// same reason: `Fabrics::update_label` rejects an over-long label outright
+/// instead of truncating it.
+pub(crate) fn truncate_to_bytes(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }
@@ -203,9 +207,8 @@ fn generate<C: Crypto>(crypto: &C, fabric_id: u64, vendor_id: u16) -> Result<Ser
 /// Rebuild an owned P-256 secret key from its persisted canonical bytes.
 /// Needed where the key must outlive the borrow of the identity: a
 /// `NocGenerator` holds a reference to the CA key for a whole commissioning
-/// flow. `install` here needs only a borrow, so the first non-test caller
-/// arrives with `ops::commission` (Task 15, plan line 4315).
-#[allow(dead_code)]
+/// flow. `install` here needs only a borrow; `ops::commission` is the caller
+/// that needs the owned form.
 pub(crate) fn canon_secret_key(bytes: &[u8]) -> Result<CanonPkcSecretKey, Error> {
     CanonPkcSecretKey::try_from(bytes)
 }

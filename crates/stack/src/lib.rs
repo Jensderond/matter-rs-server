@@ -7,4 +7,5 @@ pub(crate) mod ctx;
 pub mod identity;
 pub(crate) mod ops;
 pub(crate) mod reports;
+pub(crate) mod supervisor;
 pub mod tlv_json;

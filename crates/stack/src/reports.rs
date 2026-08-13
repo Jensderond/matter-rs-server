@@ -8,17 +8,23 @@
 //! subscription left over from before a controller restart — intended, not a
 //! failure path.
 //!
-//! **Ordering contract for Task 15:** that "intended" only holds if the `subs`
-//! entry is inserted *before* the device can send its first report — i.e. while
-//! still driving the subscribe exchange, at the moment
-//! `SubscribeEstablished::subscription_id` becomes known, and not after the
-//! subscribe helper has returned. A device that reports immediately would
-//! otherwise be told to tear down the subscription it just established.
-
-// TODO(task16): remove — the handler is installed by Task 16's runtime, and
-// `AttrAccumulator`'s third caller is Task 15's subscribe-priming loop. While
-// this is here it also suppresses genuine dead-code findings.
-#![allow(dead_code)]
+//! **Ordering contract for the supervisor:** that "intended" only holds if the
+//! `subs` entry is inserted as early as the subscription id is knowable — the
+//! instant `SubscribeOutcome::Established` is observed, with nothing awaited in
+//! between (`supervisor::establish`, rule 1). A device that reports immediately
+//! would otherwise be told to tear down the subscription it just established.
+//!
+//! Inserting it *during* the subscribe exchange would be stricter, and is
+//! **impossible at this rev** — do not go looking for a way.
+//! `SubscribePrimingChunk::complete`
+//! (`rs-matter-ref/rs-matter/src/im/client.rs:1293-1307`) reads `subs_id`, awaits
+//! `exchange.acknowledge()`, and *drops the exchange* before returning
+//! `Established`, so the id first becomes visible to us after the exchange is
+//! already gone. The residual window is that `acknowledge()`-to-return interval:
+//! sub-millisecond, and a device fast enough to report inside it gets one
+//! `InvalidSubscription`, drops its half, and is picked up by the watchdog on the
+//! next cycle — a clean recovery precisely because the resubscribe sends
+//! `keep_subs(false)`.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -191,6 +197,10 @@ impl AttrAccumulator {
     }
 
     /// Paths whose list elements could not be merged (see [`Self::append`]).
+    ///
+    /// Test-only: in production the incomplete list is reported by `append`'s own
+    /// warning at the moment it happens, so no caller needs to ask afterwards.
+    #[cfg(test)]
     pub fn orphan_appends(&self) -> &[String] {
         &self.orphan_appends
     }
@@ -216,8 +226,15 @@ fn list_index(path: &AttrPath) -> Option<u16> {
     path.list_index.as_ref().and_then(|n| n.as_opt_ref()).copied()
 }
 
+// TODO(task16): remove both allows — the handler is registered via
+// `InteractionModel::new_with_reports` by the runtime thread, which is the only
+// thing that ever constructs it. Until then nothing reaches `handle_report`, and
+// the allow on the impl is what keeps its private helpers (`node_event`,
+// `event_json`, `convert_timestamp`) from being reported dead in turn.
+#[allow(dead_code)]
 pub(crate) struct ReportSink<C: Crypto>(pub Rc<StackCtx<C>>);
 
+#[allow(dead_code)]
 impl<C: Crypto> ReportDataHandler for ReportSink<C> {
     async fn handle_report(
         &self,
@@ -269,30 +286,41 @@ impl<C: Crypto> ReportDataHandler for ReportSink<C> {
             let _ = ctx.events.send(StackEvent::AttributesChanged { node_id, changes });
         }
 
-        if let Some(events) = &report.event_reports {
-            for r in events.iter() {
-                let data = match r {
-                    Ok(EventResp::Data(data)) => data,
-                    Ok(EventResp::Status(s)) => {
-                        tracing::debug!("{who}: event status {:?} for {:?}", s.status, s.path);
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!("{who}: unparseable event report: {e}");
-                        continue;
-                    }
-                };
-                if !ctx.note_event(node_id, data.event_number) {
-                    continue; // replayed across a resubscribe
-                }
-                let _ = ctx.events.send(StackEvent::NodeEvent {
-                    node_id,
-                    event: node_event(&data),
-                });
+        walk_events(report, &who, |data| {
+            if !ctx.note_event(node_id, data.event_number) {
+                return; // replayed across a resubscribe
             }
-        }
+            let _ = ctx.events.send(StackEvent::NodeEvent { node_id, event: node_event(data) });
+        });
 
         Ok(())
+    }
+}
+
+/// Hand every parsed `EventData` in a report to `f`, in wire order.
+///
+/// Shared with `supervisor::establish`, whose priming loop only records event
+/// numbers where this handler records *and* forwards. The triage is what is worth
+/// sharing rather than the action: a per-path `Status` is expected (an event the
+/// device will not disclose) and belongs at debug, while an entry that will not
+/// parse is a device bug and belongs at warn — and both must be skipped rather
+/// than aborting the walk, or one bad event costs every later one in the report.
+pub(crate) fn walk_events(
+    report: &ReportDataResp<'_>,
+    who: &str,
+    mut f: impl FnMut(&EventData<'_>),
+) {
+    let Some(events) = &report.event_reports else {
+        return;
+    };
+    for r in events.iter() {
+        match r {
+            Ok(EventResp::Data(data)) => f(&data),
+            Ok(EventResp::Status(s)) => {
+                tracing::debug!("{who}: event status {:?} for {:?}", s.status, s.path);
+            }
+            Err(e) => tracing::warn!("{who}: unparseable event report: {e}"),
+        }
     }
 }
 
