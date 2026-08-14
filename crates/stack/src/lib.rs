@@ -6,6 +6,7 @@
 pub(crate) mod ctx;
 pub mod identity;
 pub(crate) mod mdns;
+pub mod migration;
 pub(crate) mod ops;
 pub(crate) mod reports;
 pub(crate) mod runtime;

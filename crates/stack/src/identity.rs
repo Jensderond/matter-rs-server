@@ -287,7 +287,7 @@ fn finish_identity<C: Crypto>(
 /// the smallest fix available to a downstream caller: `RcacGenerator` does not
 /// take a serial, and reaching past it to `CertGenerator` would mean owning the
 /// whole RCAC subject/issuer/extension layout here.
-fn generate_usable_rcac<C: Crypto>(
+pub(crate) fn generate_usable_rcac<C: Crypto>(
     crypto: &C,
     fabric_id: u64,
 ) -> Result<(CanonPkcSecretKey, Vec<u8>), Error> {
@@ -365,7 +365,7 @@ fn warn_if_rcac_is_not_der_canonical(rcac_tlv: &[u8]) {
 /// redundant leading zero (a strict encoder strips it). rs-matter refuses to
 /// generate the second case, but it is checked here anyway rather than relying on
 /// a private function inside a pinned dependency.
-fn serial_is_der_canonical(cert_tlv: &[u8]) -> Result<bool, Error> {
+pub(crate) fn serial_is_der_canonical(cert_tlv: &[u8]) -> Result<bool, Error> {
     // Context tag 1 of the certificate struct (`CertTag::SerialNum`);
     // `CertRef::serial_no` is private, so read the element directly.
     let serial = TLVElement::new(cert_tlv).structure()?.find_ctx(1)?.str()?;
