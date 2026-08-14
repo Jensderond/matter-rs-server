@@ -1,6 +1,11 @@
 # matter.js → matter-rs-server fabric migration: design
 
-**Status:** design approved 2026-08-14, plan not yet written.
+**Status:** design approved 2026-08-14; plan written 2026-08-14
+(`docs/superpowers/plans/2026-08-14-matterjs-fabric-migration.md`). The plan
+settled two open questions from matter.js v0.17.9 source: `del` carries an
+optional field list (fields-only delete when present; whole-key **plus
+`key.`-prefixed subtree** delete when absent; clear-all when the key is empty),
+and blank WAL lines still consume a commit offset.
 **Scope:** a one-shot tool that moves an existing matterjs-server fabric onto
 matter-rs-server so that **no device is re-commissioned**.
 
