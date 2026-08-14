@@ -1,6 +1,11 @@
 # matter.js → matter-rs-server fabric migration: design
 
-**Status:** design approved 2026-08-14, plan not yet written.
+**Status:** design approved 2026-08-14; plan written 2026-08-14
+(`docs/superpowers/plans/2026-08-14-matterjs-fabric-migration.md`). The plan
+settled two open questions from matter.js v0.17.9 source: `del` carries an
+optional field list (fields-only delete when present; whole-key **plus
+`key.`-prefixed subtree** delete when absent; clear-all when the key is empty),
+and blank WAL lines still consume a commit offset.
 **Scope:** a one-shot tool that moves an existing matterjs-server fabric onto
 matter-rs-server so that **no device is re-commissioned**.
 
@@ -340,3 +345,20 @@ Every failure must leave both stores usable.
   `<compressedFabricId>.json`, `certificates/`, `credentials/`). They are
   irrelevant to this tool but will mislead a reader into thinking the CHIP files
   are the source of truth. The tool should ignore them and say so.
+- **CONFIRMED BLOCKER (final review, 2026-08-14): matter.js RCACs carry no
+  FabricId in their subject DN** (`CertificateAuthority.ts`, v0.17.9: RCAC
+  `subject: { rcacId }` only; its NOCs get `issuer: { rcacId }`). rs-matter's
+  `NocGenerator::create` hard-requires `get_fabric_id()` on the RCAC and stamps
+  the NOC's issuer DN as `{ca_id, fabric_id}` — and devices validate a NOC's
+  issuer DN against their stored root's subject DN, so a mismatched mint would
+  be rejected at CASE even if the requirement were relaxed. The DN types are
+  `pub(crate)` in rs-matter, so no fix is possible from this repo alone: minting
+  needs an rs-matter change (a `NocGenerator` entry point that takes the fabric
+  id from the caller and mirrors the issuer DN from the RCAC's actual subject).
+  Until then the tool detects the shape and refuses with a precise error;
+  nothing is written. The server's own post-migration commissioning path
+  (`identity.rs` → `NocGenerator::create` over the stored RCAC) shares the
+  constraint, so the "still commission new ones" claim above is suspended until
+  the same fix lands. The rs-matter fixture in `crates/migrate` cannot
+  reproduce this shape (RcacGenerator always writes a FabricId), so the
+  regression test must follow the rs-matter change.
