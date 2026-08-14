@@ -94,10 +94,12 @@ pub(crate) async fn browse_one<C: Crypto>(
     exclude: &[u64],
     budget: Duration,
 ) -> Result<(Address, u64), StackError> {
-    let ms = u32::try_from(budget.as_millis()).unwrap_or(u32::MAX);
+    // The outer timer is derived from the same `ms` as the inner budget rather than
+    // from `budget` directly, so the two are always comparable.
+    let ms = budget_ms(budget);
     let inner = inner_budget_ms(ms);
     let fut = pin!(ctx.matter.transport().browse_commissionable(filter, exclude, inner));
-    let timer = pin!(Timer::after(budget));
+    let timer = pin!(Timer::after(Duration::from_millis(u64::from(ms))));
 
     match select(fut, timer).await {
         Either::First(r) => r.map_err(map_err),
@@ -134,8 +136,24 @@ const SLOT_MARGIN_MS: u32 = 100;
 /// promptly, so `NotFound` (correctly `NodeUnreachable`) is what a client sees for
 /// an empty network, and the contention message means contention. The floor at
 /// half the budget keeps a deliberately short browse from collapsing to nothing.
+///
+/// `ms == 0` is the one input with no strictly-shorter answer, which is why
+/// [`budget_ms`] never produces it.
 fn inner_budget_ms(ms: u32) -> u32 {
     ms.saturating_sub(SLOT_MARGIN_MS).max(ms / 2)
+}
+
+/// A browse budget in whole milliseconds, at least 1.
+///
+/// The floor is what keeps `inner_budget_ms(0) == 0` — the one case where the inner
+/// budget is not strictly shorter than the outer timer, making a zero budget a coin
+/// flip between `NotFound` and the contention message — off the boot path. It is
+/// reachable: `browse` only checks that the remaining budget is a non-zero number of
+/// *ticks*, so a sub-millisecond remainder does get here. Rounding it up overruns
+/// the sweep deadline by under a millisecond, once, after which the loop terminates
+/// on the next `remaining_budget`.
+fn budget_ms(budget: Duration) -> u32 {
+    u32::try_from(budget.as_millis()).unwrap_or(u32::MAX).max(1)
 }
 
 /// Log the error that ended a sweep.
@@ -268,10 +286,20 @@ mod tests {
         // A deliberately short browse keeps half rather than collapsing to zero.
         assert_eq!(inner_budget_ms(100), 50);
         assert_eq!(inner_budget_ms(2), 1);
-        // Degenerate but total: 1ms in, 0ms out — an immediate `NotFound`, which
-        // is the right answer for a budget already gone.
+        // 1ms in, 0ms out: an immediate `NotFound`, the right answer for a budget
+        // already gone.
         assert_eq!(inner_budget_ms(1), 0);
+        // The single input with no strictly-shorter answer, which is exactly what
+        // `budget_ms` exists to keep off the boot path.
         assert_eq!(inner_budget_ms(0), 0);
+        for sub_ms in [Duration::from_ticks(1), Duration::from_micros(500), Duration::MIN] {
+            assert_eq!(budget_ms(sub_ms), 1, "a sub-millisecond budget must not floor to 0");
+        }
+        assert_eq!(budget_ms(Duration::from_millis(30_000)), 30_000);
+        // The invariant the two functions only hold together: whatever a caller's
+        // `Duration` is, the inner budget ends up strictly shorter than the outer.
+        let floored = budget_ms(Duration::from_ticks(1));
+        assert!(inner_budget_ms(floored) < floored);
     }
 
     /// The whole point of the budget arithmetic: successive browses share one

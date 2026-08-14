@@ -37,10 +37,12 @@ pub(crate) const FABRIC_LABEL_MAX_BYTES: usize = 32;
 /// How many RCACs to draw before giving up on finding one a strict peer will
 /// accept. See [`serial_is_der_canonical`] for why a draw can be unusable;
 /// `RcacGenerator` picks the serial number from 8 random bytes, so just under
-/// half of all draws are usable and 16 attempts leaves a ~1-in-65000 residual.
-/// Each attempt costs one P-256 keygen plus one signature, and this runs exactly
-/// once in the lifetime of an installation.
-const RCAC_DRAW_ATTEMPTS: usize = 16;
+/// half of all draws are usable. Each attempt costs one P-256 keygen plus one
+/// signature and this runs exactly once in the lifetime of an installation, so the
+/// count is set by how bad the failure is rather than by cost: exhausting it means
+/// refusing to boot at all, with "refusing to persist a fabric" as the only
+/// symptom. 32 leaves a ~1-in-4-billion residual for a few extra milliseconds.
+const RCAC_DRAW_ATTEMPTS: usize = 32;
 
 /// Load-or-generate the controller identity and install it as a fabric on the
 /// Matter instance. Returns the identity — freshly written to `server.json` on
@@ -68,6 +70,7 @@ pub fn ensure_identity<C: Crypto>(
                     fabric_id,
                 );
             }
+            warn_if_rcac_is_not_der_canonical(&stored.rcac_tlv);
             let (fab_idx, compressed) = install(matter, crypto, &stored)?;
             if compressed != stored.compressed_fabric_id {
                 // Derived from the RCAC pubkey + fabric id, i.e. from the key
@@ -180,8 +183,23 @@ pub(crate) fn truncate_to_bytes(s: &str, max_bytes: usize) -> &str {
 /// caller needs to reproduce this fabric on a later start.
 fn generate<C: Crypto>(crypto: &C, fabric_id: u64, vendor_id: u16) -> Result<ServerIdentity, Error> {
     let (rcac_priv, rcac) = generate_usable_rcac(crypto, fabric_id)?;
-    let rcac = rcac.as_slice();
+    finish_identity(crypto, fabric_id, vendor_id, rcac_priv, &rcac)
+}
 
+/// Everything after the CA: a controller keypair, its NOC signed by `rcac`, and a
+/// fresh IPK, packed into the blobs a later start needs to reproduce this fabric.
+///
+/// Split out of [`generate`] only so a test can build an identity over a
+/// deliberately non-canonical RCAC — that is the one shape
+/// [`generate_usable_rcac`] exists to make unreachable, and the only way to have a
+/// *self-consistent* pre-fix `server.json` to boot from.
+fn finish_identity<C: Crypto>(
+    crypto: &C,
+    fabric_id: u64,
+    vendor_id: u16,
+    rcac_priv: CanonPkcSecretKey,
+    rcac: &[u8],
+) -> Result<ServerIdentity, Error> {
     // Controller operational keypair -> CSR -> NOC signed by the RCAC.
     let controller_secret_key = crypto.generate_secret_key()?;
     let mut csr_buf = [0u8; 256];
@@ -267,6 +285,38 @@ fn generate_usable_rcac<C: Crypto>(
          fabric that strict peers such as matter.js would reject"
     );
     Err(last_err.unwrap_or_else(|| ErrorCode::InvalidData.into()))
+}
+
+/// Warn if a *stored* RCAC carries a serial number strict peers will reject.
+///
+/// [`generate_usable_rcac`] only protects fabrics minted after that loop existed.
+/// A `server.json` written before it has a 50% chance of holding a non-canonical
+/// RCAC, and `create_identity` deliberately refuses to overwrite an existing one —
+/// so such an install keeps failing every matter.js commissioning with
+/// `AddTrustedRootCertificate` → "Signature verification failed" forever, with
+/// nothing anywhere connecting the two. This line is that connection.
+///
+/// Diagnostic only, on purpose. Reminting would destroy the CA key every already-
+/// commissioned node's operational certificate chains to, which is exactly what
+/// `create_identity`'s refusal-to-overwrite exists to prevent; the recovery is
+/// destructive and has to be the operator's decision.
+///
+/// Silent when the predicate cannot read the cert: this runs before `install`,
+/// which is the step that actually validates the stored blobs and fails cleanly on
+/// them, so an unparseable RCAC must not first produce a warning blaming the
+/// serial number.
+fn warn_if_rcac_is_not_der_canonical(rcac_tlv: &[u8]) {
+    if matches!(serial_is_der_canonical(rcac_tlv), Ok(false)) {
+        tracing::warn!(
+            "the stored RCAC's serial number is not a canonical DER integer, so strict peers \
+             (matter.js, and so Home Assistant's own test devices) will reject \
+             AddTrustedRootCertificate with \"Signature verification failed\" and every \
+             commissioning attempt against them will fail. This fabric was generated before the \
+             serial-number redraw fix. Commissioning against permissive peers is unaffected. \
+             Recovering means deleting server.json and re-commissioning every node — nothing is \
+             done automatically, because that discards the CA key this fabric's nodes trust."
+        );
+    }
 }
 
 /// Whether a Matter-TLV certificate's serial number is *already* the minimal
@@ -531,6 +581,76 @@ mod tests {
                 "generated RCAC serial is not DER-canonical: {rcac:02x?}"
             );
         }
+    }
+
+    /// A genuinely non-canonical RCAC — drawn straight from `RcacGenerator`, so
+    /// self-consistent and signed, exactly the `server.json` an install written
+    /// before the redraw loop holds. Returns `(identity, serial)`.
+    fn mint_pre_fix_identity<C: Crypto>(crypto: &C) -> (ServerIdentity, Vec<u8>) {
+        for _ in 0..64 {
+            let mut buf = [0u8; MAX_CERT_TLV_AND_ASN1_LEN];
+            let mut gen = RcacGenerator::new(&mut buf);
+            let Ok((priv_key, rcac)) = gen.generate(crypto, 1, VALID_FOREVER) else { continue };
+            if matches!(serial_is_der_canonical(rcac), Ok(true)) {
+                continue; // a usable draw — we specifically want the other kind
+            }
+            let serial = TLVElement::new(rcac).structure().unwrap().find_ctx(1).unwrap()
+                .str().unwrap().to_vec();
+            let rcac = rcac.to_vec();
+            let id = finish_identity(crypto, 1, 0xFFF1, priv_key, &rcac).unwrap();
+            return (id, serial);
+        }
+        panic!("64 draws without a non-canonical serial is statistically impossible");
+    }
+
+    /// An install whose `server.json` predates the redraw loop must still boot —
+    /// the RCAC is cryptographically fine, it is only *interop* that suffers, and
+    /// refusing to start would strand every node already commissioned onto it.
+    /// The warning is the whole remedy, so the classification behind it is
+    /// asserted rather than the log line (no subscriber here; same approach as
+    /// `ops::discovery`'s `an_empty_sweep_always_reports_why`).
+    #[test]
+    fn a_stored_non_canonical_rcac_still_boots_and_is_classified_as_warning_worthy() {
+        static M: StaticCell<Matter> = StaticCell::new();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let crypto = default_crypto(rand::thread_rng(), DAC_PRIVKEY);
+
+        let (pre_fix, serial) = mint_pre_fix_identity(&crypto);
+        storage.create_identity(&pre_fix).unwrap();
+
+        // The condition the warning fires on...
+        assert!(
+            matches!(serial_is_der_canonical(&pre_fix.rcac_tlv), Ok(false)),
+            "serial {serial:02x?} should have been non-canonical"
+        );
+        // ...and booting on it anyway succeeds, with the stored blobs intact.
+        let (loaded, _) = ensure_identity(init(&M), &crypto, &storage, 1, 0xFFF1, "HA")
+            .expect("a non-canonical RCAC must not keep the controller from starting");
+        assert_eq!(loaded.rcac_tlv, pre_fix.rcac_tlv, "the RCAC must NOT be reminted");
+        assert_eq!(loaded.ca_private_key, pre_fix.ca_private_key);
+        assert_eq!(storage.load_identity().unwrap().unwrap().rcac_tlv, pre_fix.rcac_tlv);
+    }
+
+    /// The three branches of the warn shell, including the one that must stay
+    /// silent: `install` is what validates the stored blobs and fails cleanly on
+    /// them, so an unreadable RCAC must not first be blamed on its serial number.
+    #[test]
+    fn the_stored_rcac_warning_is_silent_for_canonical_and_unreadable_certs() {
+        let crypto = default_crypto(rand::thread_rng(), DAC_PRIVKEY);
+        let (_, good) = generate_usable_rcac(&crypto, 1).unwrap();
+        let (bad, _) = mint_pre_fix_identity(&crypto);
+
+        assert!(matches!(serial_is_der_canonical(&good), Ok(true)));          // silent
+        assert!(matches!(serial_is_der_canonical(&bad.rcac_tlv), Ok(false))); // warns
+        assert!(serial_is_der_canonical(&[]).is_err());                       // silent
+        assert!(serial_is_der_canonical(b"not a cert").is_err());             // silent
+
+        // Every branch, for panic-freedom — this runs on the boot path.
+        warn_if_rcac_is_not_der_canonical(&good);
+        warn_if_rcac_is_not_der_canonical(&bad.rcac_tlv);
+        warn_if_rcac_is_not_der_canonical(&[]);
+        warn_if_rcac_is_not_der_canonical(b"not a cert");
     }
 
     /// The predicate itself, against the cases matter.js's `DerCodec` distinguishes

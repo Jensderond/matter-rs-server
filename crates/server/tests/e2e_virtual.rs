@@ -121,10 +121,11 @@ async fn commissions_controls_and_reports_a_virtual_matter_js_device() {
     assert!(!first.is_empty() && !first.contains('['), "addresses were {addrs}");
     assert!(first.parse::<std::net::IpAddr>().is_ok(), "unusable address {first:?}");
 
-    // Kills both children even on an assertion failure above (`kill_on_drop`),
-    // but be explicit so the device is gone before `device_dir` is removed.
+    // Explicit so both are gone before their storage dirs are removed. The server
+    // is a direct child, so `kill` reaps it; the device needs its whole process
+    // group — see `kill_device`.
     let _ = server.kill().await;
-    let _ = device.kill().await;
+    kill_device(&mut device).await;
 }
 
 /// Spawns the device and scrapes its QR payload, returning `(child, "MT:…")`.
@@ -139,6 +140,12 @@ async fn start_device(storage: &std::path::Path) -> (Child, String) {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true)
+        // Its own process group, so `kill_device` can take the whole tree down —
+        // `npx` execs the real `.bin/matter-device` as a *descendant*, and killing
+        // only the child we spawned can leave that grandchild alive holding UDP
+        // 5540 and the mDNS advertisement, which would make the *next* run of this
+        // test fail in `start_device` for no visible reason.
+        .process_group(0)
         .spawn()
         .expect("npx not on PATH");
 
@@ -169,6 +176,25 @@ async fn start_device(storage: &std::path::Path) -> (Child, String) {
         .expect("the device exited before printing a pairing code");
     assert!(code.starts_with("MT:"), "unexpected QR payload {code:?}");
     (child, code)
+}
+
+/// Kill the device's whole process group, then reap the child we own.
+///
+/// `process_group(0)` made the spawned `npx` the group leader, so its pgid equals
+/// its pid and `kill -KILL -<pid>` reaches the `.bin/matter-device` grandchild too.
+/// Via `kill(1)` rather than a `nix`/`libc` dependency, matching `smoke.rs`'s
+/// SIGTERM helper. Best-effort throughout: this is cleanup, and the `kill_on_drop`
+/// on the handle is still the backstop for the direct child.
+async fn kill_device(device: &mut Child) {
+    if let Some(pid) = device.id() {
+        let _ = tokio::process::Command::new("kill")
+            .args(["-KILL", &format!("-{pid}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    let _ = device.kill().await;
 }
 
 /// Spawns the binary on an ephemeral port, returning `(child, "127.0.0.1:port")`.

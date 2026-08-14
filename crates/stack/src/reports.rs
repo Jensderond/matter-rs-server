@@ -658,9 +658,9 @@ mod tests {
         assert_eq!((ms, ty), (90_000, 0));
     }
 
-    /// Unlike the epoch branch, the system branch forwards the raw `u64`, so the
-    /// `i64` clamp is genuinely reachable and must not produce a negative
-    /// timestamp.
+    /// The sibling of `epoch_timestamp_beyond_i64_saturates`: since the epoch fix
+    /// both branches forward the raw `u64`, so both have a reachable `i64` clamp
+    /// and neither may produce a negative timestamp.
     #[test]
     fn system_timestamp_beyond_i64_saturates() {
         let (ms, ty) = convert_timestamp(&EventDataTimestamp::SystemTimestamp(u64::MAX));
