@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use matter_rs_wire::node::MatterNodeData;
 use serde_json::Value;
 
+use crate::lock::lock;
 use crate::storage::NodeRecord;
 
 pub struct NodeEntry {
@@ -27,20 +28,20 @@ impl Registry {
         Self { inner: Mutex::new(inner) }
     }
 
-    pub fn contains(&self, node_id: u64) -> bool { self.inner.lock().unwrap().contains_key(&node_id) }
-    pub fn node_ids(&self) -> Vec<u64> { self.inner.lock().unwrap().keys().copied().collect() }
-    pub fn len(&self) -> usize { self.inner.lock().unwrap().len() }
+    pub fn contains(&self, node_id: u64) -> bool { lock(&self.inner).contains_key(&node_id) }
+    pub fn node_ids(&self) -> Vec<u64> { lock(&self.inner).keys().copied().collect() }
+    pub fn len(&self) -> usize { lock(&self.inner).len() }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 
     pub fn insert(&self, record: NodeRecord) {
-        self.inner.lock().unwrap().insert(record.node_id, NodeEntry { record, available: false });
+        lock(&self.inner).insert(record.node_id, NodeEntry { record, available: false });
     }
     pub fn remove(&self, node_id: u64) -> bool {
-        self.inner.lock().unwrap().remove(&node_id).is_some()
+        lock(&self.inner).remove(&node_id).is_some()
     }
 
     pub fn with_entry<R>(&self, node_id: u64, f: impl FnOnce(&mut NodeEntry) -> R) -> Option<R> {
-        self.inner.lock().unwrap().get_mut(&node_id).map(f)
+        lock(&self.inner).get_mut(&node_id).map(f)
     }
 
     /// Returns Some(changed) or None when the node is unknown.
@@ -53,18 +54,18 @@ impl Registry {
     }
 
     pub fn node_data(&self, node_id: u64) -> Option<MatterNodeData> {
-        self.inner.lock().unwrap().get(&node_id).map(|e| build_node_data(&e.record, e.available))
+        lock(&self.inner).get(&node_id).map(|e| build_node_data(&e.record, e.available))
     }
 
     pub fn all_node_data(&self, only_available: bool) -> Vec<MatterNodeData> {
-        self.inner.lock().unwrap().values()
+        lock(&self.inner).values()
             .filter(|e| !only_available || e.available)
             .map(|e| build_node_data(&e.record, e.available))
             .collect()
     }
 
     pub fn snapshot_record(&self, node_id: u64) -> Option<NodeRecord> {
-        self.inner.lock().unwrap().get(&node_id).map(|e| e.record.clone())
+        lock(&self.inner).get(&node_id).map(|e| e.record.clone())
     }
 }
 

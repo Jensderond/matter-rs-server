@@ -7,8 +7,21 @@ use matter_rs_wire::error::ServerErrorCode;
 
 use crate::api::CommandError;
 use crate::commands::{opt_bool, opt_u64, require_u64, stack_err};
+use crate::lock::lock;
 use crate::real::MatterController;
 use crate::storage::format_node_date;
+
+/// Upper bound on `ping_node`'s client-supplied `attempts`.
+const MAX_PING_ATTEMPTS: u64 = 10;
+
+/// Clamped, not validated: `attempts` becomes `ping -c <attempts>` with a 1s
+/// interval, and `futures_join_all` walks the addresses sequentially, so an
+/// unclamped `attempts: 1000` would occupy a command handler for ~1000s *per
+/// address*. Nothing legitimate asks for more than a handful, and silently
+/// capping beats failing a request that is merely over-eager.
+fn ping_attempts(args: &Map<String, Value>) -> u64 {
+    opt_u64(args, "attempts").unwrap_or(1).clamp(1, MAX_PING_ATTEMPTS)
+}
 
 pub async fn get_nodes(c: &MatterController, args: &Map<String, Value>) -> Result<Value, CommandError> {
     let only_available = opt_bool(args, "only_available").unwrap_or(false);
@@ -24,7 +37,7 @@ pub async fn get_node(c: &MatterController, args: &Map<String, Value>) -> Result
 
 pub async fn diagnostics(c: &MatterController, args: &Map<String, Value>) -> Result<Value, CommandError> {
     let nodes = get_nodes(c, args).await?;
-    let events: Vec<Value> = c.history.lock().unwrap().iter().cloned().collect();
+    let events: Vec<Value> = lock(&c.history).iter().cloned().collect();
     Ok(json!({ "info": c.build_server_info(), "nodes": nodes, "events": events }))
 }
 
@@ -79,7 +92,7 @@ async fn merged_addresses(c: &MatterController, node_id: u64) -> Vec<String> {
 pub async fn ping_node(c: &MatterController, args: &Map<String, Value>) -> Result<Value, CommandError> {
     let node_id = require_u64(args, "node_id")?;
     c.ensure_node(node_id)?;
-    let attempts = opt_u64(args, "attempts").unwrap_or(1).max(1);
+    let attempts = ping_attempts(args);
     let addrs = merged_addresses(c, node_id).await;
     let mut results = Map::new();
     let futures: Vec<_> = addrs.iter().map(|a| ping_one(a.clone(), attempts)).collect();
@@ -123,4 +136,23 @@ pub async fn get_node_ip_addresses(c: &MatterController, args: &Map<String, Valu
     let mut seen = std::collections::HashSet::new();
     let addrs: Vec<String> = addrs.into_iter().filter(|a| seen.insert(a.clone())).collect();
     Ok(serde_json::to_value(addrs).unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ping_attempts, MAX_PING_ATTEMPTS};
+    use serde_json::json;
+
+    /// The clamp itself, since exercising it through `ping_node` would mean
+    /// actually shelling out to `ping` for ten seconds.
+    #[test]
+    fn ping_attempts_is_clamped_to_a_sane_range() {
+        let args = |v: serde_json::Value| v.as_object().unwrap().clone();
+        assert_eq!(ping_attempts(&args(json!({}))), 1);
+        assert_eq!(ping_attempts(&args(json!({"attempts": 0}))), 1);
+        assert_eq!(ping_attempts(&args(json!({"attempts": 3}))), 3);
+        assert_eq!(ping_attempts(&args(json!({"attempts": 1000}))), MAX_PING_ATTEMPTS);
+        // Not a number at all -> the default, as before.
+        assert_eq!(ping_attempts(&args(json!({"attempts": "many"}))), 1);
+    }
 }

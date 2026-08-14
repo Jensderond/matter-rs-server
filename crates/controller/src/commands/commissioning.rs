@@ -7,48 +7,32 @@ use serde_json::{json, Map, Value};
 use matter_rs_wire::error::ServerErrorCode;
 use matter_rs_wire::node::CommissionableNodeData;
 
+use crate::addr::split_ip_port;
 use crate::api::CommandError;
-use crate::commands::{err, invalid, opt_str, opt_u64, require_u64, stack_err};
+use crate::commands::{err, invalid, narrow, opt_str, opt_u64, require_u64, stack_err};
 use crate::real::MatterController;
 use crate::stack_api::{CommissionRequest, PaseTarget};
 use crate::storage::{allocate_node_id, format_node_date, NodeRecord};
 
-/// Splits `"ip:port"` into `(ip, Some(port))`, unwrapping the brackets an IPv6
-/// socket address carries; passes through unchanged (`None` port) when there is
-/// no port to strip.
+/// A failed commission or its follow-up interview, as the client sees it.
 ///
-/// The bracket branch has to come first. rs-matter renders an IPv6 peer as
-/// `"[fe80::1%14]:5540"`, and a bare `rsplit_once(':')` on that leaves the
-/// brackets on the host — which is what used to get persisted into
-/// `NodeRecord::addresses`, so `get_node_ip_addresses` (which cuts the scope id
-/// off at `%`) answered a client with the unclosed literal `"[fe80::1"` and
-/// `ping_node` handed `ping6` an address it cannot parse.
+/// Routed through `stack_err` rather than pinned to `NodeCommissionFailed` (1):
+/// `ops::commission` deliberately classifies a mistyped pairing code and an
+/// unparseable `ip_addr` as `InvalidArguments`, and flattening every kind to 1
+/// threw that away — while an *empty* `code` in the same command already answers
+/// 8 (`commission_with_code` below). So: `InvalidArguments -> 8`,
+/// `NodeUnreachable -> 4`, everything else -> 1. The `"Commission failed: "`
+/// prefix is kept on every kind, because that is the string HA surfaces.
 ///
-/// `stack::ops::ip_of` does the same job for the live-address path and the
-/// duplication is deliberate: `controller` cannot depend on `stack`, the
-/// dependency runs the other way.
-fn split_ip_port(address: &str) -> (String, Option<u16>) {
-    if let Some(rest) = address.strip_prefix('[') {
-        return match rest.split_once(']') {
-            // The host is exactly what the brackets held, whether or not a
-            // `:port` follows.
-            Some((host, tail)) => {
-                (host.to_string(), tail.strip_prefix(':').and_then(|p| p.parse().ok()))
-            }
-            // Unterminated bracket: not something rs-matter produces, but
-            // returning the remainder beats returning the `[`.
-            None => (rest.to_string(), None),
-        };
-    }
-    // Unbracketed. More than one colon means an IPv6 literal written without
-    // brackets, which therefore cannot carry a port — take it whole.
-    if address.matches(':').count() > 1 {
-        return (address.to_string(), None);
-    }
-    match address.rsplit_once(':') {
-        Some((ip, port)) => (ip.to_string(), port.parse().ok()),
-        None => (address.to_string(), None),
-    }
+/// UNVERIFIED against the Node server: `matterjs-server` is not checked out on
+/// this machine, so which code *it* answers for a malformed pairing code is
+/// unknown, and this choice is made on internal consistency alone. If you have
+/// the Node source, check `commission_with_code`'s error path there before
+/// "fixing" this either way.
+fn commission_failed(e: crate::stack_api::StackError) -> CommandError {
+    let mut mapped = stack_err(ServerErrorCode::NodeCommissionFailed, e);
+    mapped.details = format!("Commission failed: {}", mapped.details);
+    mapped
 }
 
 /// Shared commission -> interview -> persist -> supervise flow, used by both
@@ -58,27 +42,27 @@ fn split_ip_port(address: &str) -> (String, Option<u16>) {
 async fn do_commission(c: &MatterController, target: PaseTarget) -> Result<Value, CommandError> {
     let _guard = c.alloc_lock.lock().await;
 
-    // Allocate + persist the node id BEFORE commissioning (never hold the
-    // std config Mutex across an await: update_config clones, mutates,
-    // saves, and writes back synchronously, all before the await below).
-    let node_id = c.update_config(|cfg| {
+    // Allocate + persist the node id BEFORE commissioning. `update_config`
+    // serializes the whole read-modify-write itself, so `alloc_lock` is no longer
+    // what keeps two allocations apart — it still is what keeps two PASE flows
+    // apart. A persistence failure is logged inside `update_config` and does not
+    // abort the flow: the id is reserved in memory for the rest of this run
+    // (`registry.contains` sees it once the node is inserted), and refusing to
+    // commission because config.json could not be rewritten would be a worse
+    // trade on a homelab disk that just filled up.
+    let (node_id, _persisted) = c.update_config(|cfg| {
         allocate_node_id(cfg, |id| c.registry.contains(id) || id == c.identity.controller_node_id)
-    });
+    }).await;
     let fabric_label = c.config_snapshot().fabric_label;
 
     let req = CommissionRequest { node_id, target, fabric_label };
-    let outcome = c.stack.commission(req).await.map_err(|e| {
-        err(ServerErrorCode::NodeCommissionFailed, format!("Commission failed: {}", e.message))
-    })?;
+    let outcome = c.stack.commission(req).await.map_err(commission_failed)?;
 
     let attributes = match c.stack.interview(node_id).await {
         Ok(a) => a,
         Err(e) => {
             let _ = c.stack.remove_device_fabric(node_id, outcome.device_fabric_index).await;
-            return Err(err(
-                ServerErrorCode::NodeCommissionFailed,
-                format!("Commission failed: {}", e.message),
-            ));
+            return Err(commission_failed(e));
         }
     };
 
@@ -119,27 +103,29 @@ pub async fn commission_with_code(c: &MatterController, args: &Map<String, Value
 }
 
 pub async fn commission_on_network(c: &MatterController, args: &Map<String, Value>) -> Result<Value, CommandError> {
-    let passcode = opt_u64(args, "setup_pin_code")
-        .map(|v| v as u32)
-        .ok_or_else(|| invalid("No passcode provided"))?;
+    let passcode: u32 = narrow(
+        opt_u64(args, "setup_pin_code").ok_or_else(|| invalid("No passcode provided"))?,
+        "setup_pin_code",
+    )?;
     let filter_type = opt_u64(args, "filter_type");
     let filter = opt_u64(args, "filter");
 
+    // Each filter is narrowed to the width mDNS actually advertises it in, so an
+    // out-of-range value is rejected instead of silently discovering a different
+    // device (`filter: 256` as a short discriminator used to mean 0).
     let (mut short_discriminator, mut long_discriminator, mut vendor_id) = (None, None, None);
     match filter_type {
         Some(1) => {
-            short_discriminator = Some(
-                filter.ok_or_else(|| invalid("filter required for filter_type 1 (short discriminator)"))? as u8,
-            );
+            let f = filter.ok_or_else(|| invalid("filter required for filter_type 1 (short discriminator)"))?;
+            short_discriminator = Some(narrow::<u8>(f, "filter (short discriminator)")?);
         }
         Some(2) => {
-            long_discriminator = Some(
-                filter.ok_or_else(|| invalid("filter required for filter_type 2 (long discriminator)"))? as u16,
-            );
+            let f = filter.ok_or_else(|| invalid("filter required for filter_type 2 (long discriminator)"))?;
+            long_discriminator = Some(narrow::<u16>(f, "filter (long discriminator)")?);
         }
         Some(3) => {
-            vendor_id =
-                Some(filter.ok_or_else(|| invalid("filter required for filter_type 3 (vendor ID)"))? as u16);
+            let f = filter.ok_or_else(|| invalid("filter required for filter_type 3 (vendor ID)"))?;
+            vendor_id = Some(narrow::<u16>(f, "filter (vendor ID)")?);
         }
         _ => {}
     }
@@ -155,7 +141,8 @@ pub async fn open_commissioning_window(c: &MatterController, args: &Map<String, 
     let node_id = require_u64(args, "node_id")?;
     c.ensure_node(node_id)?;
     // iteration/option/discriminator accepted-and-ignored (Node behavior).
-    let timeout = opt_u64(args, "timeout").unwrap_or(300) as u16;
+    // 65536 used to truncate to 0, i.e. a window closing the instant it opened.
+    let timeout: u16 = narrow(opt_u64(args, "timeout").unwrap_or(300), "timeout")?;
     let info = c
         .stack
         .open_commissioning_window(node_id, timeout)
@@ -257,26 +244,8 @@ mod tests {
         assert_eq!(v, json!(["fe80::87f:8d29:2561:f7fb%14"]));
     }
 
-    #[test]
-    fn split_ip_port_handles_every_address_form_rs_matter_produces() {
-        use super::split_ip_port;
-        let cases: &[(&str, (&str, Option<u16>))] = &[
-            ("192.168.1.60:5540", ("192.168.1.60", Some(5540))),
-            ("192.168.1.60", ("192.168.1.60", None)),
-            ("[fe80::1%14]:5540", ("fe80::1%14", Some(5540))),
-            ("[fd12::5]:5540", ("fd12::5", Some(5540))),
-            ("[fd12::5]", ("fd12::5", None)),
-            // Not shapes rs-matter emits, but they must not produce a `[` either.
-            ("[fd12::5", ("fd12::5", None)),
-            ("fe80::1", ("fe80::1", None)),
-            ("192.168.1.60:notaport", ("192.168.1.60", None)),
-        ];
-        for (input, (ip, port)) in cases {
-            let got = split_ip_port(input);
-            assert_eq!((got.0.as_str(), got.1), (*ip, *port), "for {input:?}");
-            assert!(!got.0.contains('['), "for {input:?}");
-        }
-    }
+    // The per-form unit test for the splitter moved with the function itself, to
+    // `crate::addr`. The end-to-end case above is the one that belongs here.
 
     #[tokio::test]
     async fn commission_with_code_empty_code() {
@@ -296,6 +265,30 @@ mod tests {
         assert_eq!(e.code.code(), 1);
         assert!(e.details.starts_with("Commission failed: "));
         assert!(e.details.contains("busy"));
+    }
+
+    /// Important-3 regression: `ops::commission` classifies a mistyped pairing
+    /// code and an unparseable `ip_addr` as `InvalidArguments`, and `do_commission`
+    /// used to flatten every kind to 1 — two lines away from an *empty* code
+    /// answering 8. The classification now survives, with 1 still the default.
+    #[tokio::test]
+    async fn commission_failure_keeps_the_stacks_error_classification() {
+        use crate::stack_api::{StackError, StackErrorKind};
+        for (kind, expected) in [
+            (StackErrorKind::InvalidArguments, 8),
+            (StackErrorKind::NodeUnreachable, 4),
+            (StackErrorKind::Timeout, 1),
+            (StackErrorKind::Sdk, 1),
+            (StackErrorKind::Busy, 1),
+        ] {
+            let r = rig();
+            *r.stack.commission_response.lock().unwrap() =
+                Some(Err(StackError::new(kind, "nope")));
+            let e = call(&r, "commission_with_code", json!({"code": "MT:BAD"})).await.unwrap_err();
+            assert_eq!(e.code.code(), expected, "for {kind:?}");
+            // The prefix HA surfaces is kept on every kind.
+            assert_eq!(e.details, "Commission failed: nope", "for {kind:?}");
+        }
     }
 
     #[tokio::test]

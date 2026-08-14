@@ -1,3 +1,4 @@
+pub mod addr;
 pub mod api;
 pub mod stub;
 pub mod storage;
@@ -7,3 +8,5 @@ pub mod node_manager;
 pub mod real;
 pub mod commands;
 pub mod vendors;
+
+pub(crate) mod lock;

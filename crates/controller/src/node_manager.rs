@@ -10,6 +10,7 @@ use matter_rs_wire::node::MatterNodeEvent;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc};
 
+use crate::lock::lock;
 use crate::registry::Registry;
 use crate::stack_api::{NodeConnState, NodeEventData, StackEvent};
 use crate::storage::{format_node_date, Storage};
@@ -159,7 +160,7 @@ fn handle_event(
             let payload = build_node_event(node_id, event);
             let data = serde_json::to_value(&payload).expect("MatterNodeEvent serializes");
             {
-                let mut h = history.lock().unwrap();
+                let mut h = lock(history);
                 if h.len() >= EVENT_HISTORY_SIZE { h.pop_front(); }
                 h.push_back(data.clone());
             }

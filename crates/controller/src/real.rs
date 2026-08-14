@@ -12,6 +12,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::api::{CommandError, ConnId, Controller};
 use crate::commands;
+use crate::lock::lock;
 use crate::node_manager::NodeManager;
 use crate::registry::Registry;
 use crate::stack_api::{Stack, StackEvent};
@@ -30,6 +31,11 @@ pub struct MatterController {
     pub(crate) fabric_index: u8,
     pub(crate) sdk_version: String,
     pub(crate) config: Mutex<ConfigData>,
+    /// Serializes the whole config read-modify-write (see `update_config`).
+    /// Separate from `config` on purpose: a `std::sync::Mutex` must not be held
+    /// across an await, and `config` exists so `config_snapshot` stays a cheap
+    /// synchronous clone.
+    pub(crate) config_write: tokio::sync::Mutex<()>,
     pub(crate) alloc_lock: tokio::sync::Mutex<()>,
     pub(crate) events: broadcast::Sender<EventMessage>,
     pub(crate) history: Arc<Mutex<VecDeque<Value>>>,
@@ -59,7 +65,8 @@ impl MatterController {
 
         let ctrl = Arc::new(Self {
             stack, storage, registry, identity, fabric_index, sdk_version,
-            config: Mutex::new(config), alloc_lock: tokio::sync::Mutex::new(()),
+            config: Mutex::new(config), config_write: tokio::sync::Mutex::new(()),
+            alloc_lock: tokio::sync::Mutex::new(()),
             events, history, label_locked, label_owner: Mutex::new(None), log,
         });
 
@@ -74,20 +81,44 @@ impl MatterController {
         ctrl
     }
 
-    pub(crate) fn config_snapshot(&self) -> ConfigData { self.config.lock().unwrap().clone() }
+    pub(crate) fn config_snapshot(&self) -> ConfigData { lock(&self.config).clone() }
 
-    /// Clone-mutate-save-writeback the config under the std Mutex, never
-    /// holding the lock across an await (this helper is fully sync; callers
-    /// invoke it between awaits). `f` may return a value derived from the
-    /// mutation (e.g. an allocated node id).
-    pub(crate) fn update_config<R>(&self, f: impl FnOnce(&mut ConfigData) -> R) -> R {
-        let mut cfg = self.config.lock().unwrap().clone();
+    /// Clone-mutate-save-writeback of the config, serialized against every other
+    /// caller. `f` may return a value derived from the mutation (e.g. an
+    /// allocated node id).
+    ///
+    /// **The `config_write` lock is the point of this function.** Commands from
+    /// two different WS connections run as independent tasks (`ws.rs` serializes
+    /// only *within* one connection), and five commands mutate the config. With
+    /// the read-modify-write unserialized, T1 clones, T2 clones, T1 saves, T2
+    /// saves — and T1's mutation is gone from both disk and memory. Only
+    /// `do_commission` used to hold anything (`alloc_lock`), which is why this
+    /// lock is here and not there.
+    ///
+    /// It is a *tokio* mutex because it spans the save; nothing below actually
+    /// awaits, but a `std::sync::Mutex` held across a future's yield point is
+    /// exactly the shape that must never appear here, and the type makes that
+    /// impossible rather than merely true today. `self.config` stays a std mutex
+    /// and is held only for a clone or an assignment.
+    ///
+    /// The in-memory value commits even when persistence fails, deliberately:
+    /// `do_commission` needs its allocated node id to stay reserved for the rest
+    /// of this process run, or a second commissioning would hand out the same id.
+    /// So the returned `io::Result` means "did this survive a restart", not "was
+    /// this applied" — the credential family reports it to the client on that
+    /// understanding.
+    pub(crate) async fn update_config<R>(
+        &self, f: impl FnOnce(&mut ConfigData) -> R,
+    ) -> (R, std::io::Result<()>) {
+        let _write = self.config_write.lock().await;
+        let mut cfg = self.config_snapshot();
         let result = f(&mut cfg);
-        if let Err(e) = self.storage.save_config(&cfg) {
+        let persisted = self.storage.save_config(&cfg);
+        if let Err(e) = &persisted {
             tracing::error!("persist config: {e}");
         }
-        *self.config.lock().unwrap() = cfg;
-        result
+        *lock(&self.config) = cfg;
+        (result, persisted)
     }
 
     pub(crate) fn ensure_node(&self, node_id: u64) -> Result<(), CommandError> {
@@ -172,7 +203,7 @@ impl Controller for MatterController {
     }
 
     fn connection_closed(&self, conn: ConnId) {
-        let mut owner = self.label_owner.lock().unwrap();
+        let mut owner = lock(&self.label_owner);
         if *owner == Some(conn) { *owner = None; }
     }
 
@@ -348,6 +379,114 @@ mod tests {
         let e = call(&r, "frobnicate", json!({})).await.unwrap_err();
         assert_eq!(e.code.code(), 9);
         assert_eq!(e.details, "Unknown command: frobnicate");
+    }
+
+    /// Important-1 regression. `update_config` is a read-modify-write and the
+    /// commands that call it run as independent tasks (`ws.rs` serializes only
+    /// within one connection, and two connections is the normal case: HA plus a
+    /// debug client, or a reconnect while the old one still drains). Before the
+    /// `config_write` lock, T1 could clone, T2 clone, T1 save, T2 save — and T1's
+    /// mutation was gone from both disk and memory.
+    ///
+    /// Verified to fail with the lock removed: "lost wifi credentials".
+    ///
+    /// Two OS threads, each driving its own current-thread runtime, rather than
+    /// two tasks: `update_config`'s body has no await inside it, so two tasks on
+    /// one worker thread never interleave and the bug is invisible. (A
+    /// `multi_thread` test runtime would also do it, but that means adding
+    /// tokio's `rt-multi-thread` to this crate's dev-dependencies — a feature-set
+    /// change that costs a full rs-matter rebuild — and it would leave the
+    /// interleaving up to the scheduler instead of guaranteeing it.)
+    #[test]
+    fn concurrent_config_writers_never_lose_each_others_mutations() {
+        use crate::storage::WifiCredential;
+        const N: u64 = 50;
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let r = rt.block_on(async { rig() });
+
+        std::thread::scope(|scope| {
+            let c = &r.ctrl;
+            scope.spawn(move || {
+                block_on_current_thread(async {
+                    for i in 0..N {
+                        c.update_config(|cfg| {
+                            cfg.wifi_credentials.insert(
+                                format!("wifi{i}"),
+                                WifiCredential { ssid: format!("ssid{i}"), password: "pw".into() },
+                            );
+                        })
+                        .await;
+                    }
+                });
+            });
+            scope.spawn(move || {
+                block_on_current_thread(async {
+                    for i in 0..N {
+                        c.update_config(|cfg| {
+                            cfg.thread_datasets.insert(format!("thread{i}"), "0e08".into());
+                        })
+                        .await;
+                    }
+                });
+            });
+        });
+
+        let in_memory = r.ctrl.config_snapshot();
+        // ...and what the NEXT BOOT would see, re-read from config.json.
+        let on_disk = r.ctrl.storage.load_config();
+        for cfg in [&in_memory, &on_disk] {
+            assert_eq!(cfg.wifi_credentials.len(), N as usize, "lost wifi credentials");
+            assert_eq!(cfg.thread_datasets.len(), N as usize, "lost thread datasets");
+            for i in 0..N {
+                assert!(cfg.wifi_credentials.contains_key(&format!("wifi{i}")));
+                assert!(cfg.thread_datasets.contains_key(&format!("thread{i}")));
+            }
+        }
+    }
+
+    /// The same race through the actual command surface, which is how it is
+    /// reachable: `set_wifi_credentials` and `set_thread_dataset` are two of the
+    /// five config writers and neither holds any lock of its own. Two connections,
+    /// because `ws.rs` serializes commands only within one.
+    #[test]
+    fn concurrent_credential_commands_from_two_connections_both_survive() {
+        use crate::api::{ConnId, Controller};
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let r = rt.block_on(async { rig() });
+
+        std::thread::scope(|scope| {
+            let c = &r.ctrl;
+            scope.spawn(move || {
+                block_on_current_thread(async {
+                    for i in 0..20 {
+                        c.handle_command(ConnId(1), &cmd("set_wifi_credentials",
+                            json!({"ssid": format!("iot{i}"), "credentials": "pw", "id": format!("w{i}")})))
+                            .await.unwrap();
+                    }
+                });
+            });
+            scope.spawn(move || {
+                block_on_current_thread(async {
+                    for i in 0..20 {
+                        c.handle_command(ConnId(2), &cmd("set_thread_dataset",
+                            json!({"dataset": "0e080000000000010000", "id": format!("t{i}")})))
+                            .await.unwrap();
+                    }
+                });
+            });
+        });
+
+        let on_disk = r.ctrl.storage.load_config();
+        assert_eq!(on_disk.wifi_credentials.len(), 20, "lost wifi credentials: {on_disk:?}");
+        assert_eq!(on_disk.thread_datasets.len(), 20, "lost thread datasets: {on_disk:?}");
+    }
+
+    /// Drives one future to completion on the calling thread. Needed by the two
+    /// concurrency tests above, which use real OS threads (see there) and so
+    /// cannot borrow the test's runtime.
+    fn block_on_current_thread<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
     }
 
     #[tokio::test]

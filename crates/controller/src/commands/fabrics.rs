@@ -8,7 +8,8 @@ use matter_rs_wire::error::ServerErrorCode;
 use matter_rs_wire::node::MatterFabricData;
 
 use crate::api::{CommandError, ConnId};
-use crate::commands::{err, invalid, require_u64, stack_err};
+use crate::commands::{err, invalid, narrow, require_u64, stack_err};
+use crate::lock::lock;
 use crate::real::MatterController;
 use crate::storage::normalize_fabric_label;
 
@@ -26,7 +27,7 @@ pub async fn set_default_fabric_label(
 
     let mut claimed_fresh = false;
     {
-        let mut owner = c.label_owner.lock().unwrap();
+        let mut owner = lock(&c.label_owner);
         match *owner {
             None => {
                 *owner = Some(conn);
@@ -44,12 +45,15 @@ pub async fn set_default_fabric_label(
     let label = normalize_fabric_label(label_arg);
     match c.stack.update_fabric_label(label.clone()).await {
         Ok(()) => {
-            c.update_config(|cfg| cfg.fabric_label = label);
+            // The label is already live on the fabric; a config.json that could
+            // not be rewritten is logged inside `update_config` and does not turn
+            // a successful device-side update into a client-visible failure.
+            let (_, _persisted) = c.update_config(|cfg| cfg.fabric_label = label).await;
             Ok(Value::Null)
         }
         Err(e) => {
             if claimed_fresh {
-                let mut owner = c.label_owner.lock().unwrap();
+                let mut owner = lock(&c.label_owner);
                 if *owner == Some(conn) {
                     *owner = None;
                 }
@@ -88,7 +92,9 @@ pub async fn get_matter_fabrics(c: &MatterController, args: &Map<String, Value>)
 pub async fn remove_matter_fabric(c: &MatterController, args: &Map<String, Value>) -> Result<Value, CommandError> {
     let node_id = require_u64(args, "node_id")?;
     c.ensure_node(node_id)?;
-    let fabric_index = require_u64(args, "fabric_index")? as u8;
+    // `256 as u8` is 0 — which is not "no fabric" to a device, it is a
+    // RemoveFabric aimed at whatever sits at index 0.
+    let fabric_index: u8 = narrow(require_u64(args, "fabric_index")?, "fabric_index")?;
     c.stack
         .remove_device_fabric(node_id, fabric_index)
         .await
@@ -175,7 +181,7 @@ fn map_binding(binding: &Value) -> Value {
 pub async fn set_node_binding(c: &MatterController, args: &Map<String, Value>) -> Result<Value, CommandError> {
     let node_id = require_u64(args, "node_id")?;
     c.ensure_node(node_id)?;
-    let endpoint = require_u64(args, "endpoint")? as u16;
+    let endpoint: u16 = narrow(require_u64(args, "endpoint")?, "endpoint")?;
     let bindings = args.get("bindings").and_then(Value::as_array)
         .ok_or_else(|| invalid("missing or invalid required argument: bindings"))?;
 
@@ -245,6 +251,20 @@ mod tests {
         assert_eq!(v[0]["fabric_label"], "HomeAssistant");
         let v = call(&r, "remove_matter_fabric", json!({"node_id": 5, "fabric_index": 3})).await.unwrap();
         assert_eq!(v, json!({}));
+    }
+
+    /// Important-2 regression on the other representative site: `256 as u8` is 0,
+    /// so this used to be a RemoveFabric aimed at index 0 instead of an error.
+    #[tokio::test]
+    async fn out_of_range_fabric_index_is_rejected_not_truncated() {
+        let r = rig_with_nodes(vec![node_record(5)]);
+        let e = call(&r, "remove_matter_fabric", json!({"node_id": 5, "fabric_index": 256}))
+            .await.unwrap_err();
+        assert_eq!(e.code.code(), 8);
+        assert_eq!(e.details, "fabric_index out of range: 256");
+        assert!(!r.stack.calls().iter().any(|c| c.starts_with("remove_device_fabric")));
+        // The top of the u8 range still works.
+        call(&r, "remove_matter_fabric", json!({"node_id": 5, "fabric_index": 255})).await.unwrap();
     }
 
     #[tokio::test]

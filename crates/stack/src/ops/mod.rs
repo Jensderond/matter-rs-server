@@ -39,30 +39,13 @@ pub(crate) fn addr_to_string(addr: &Address) -> String {
 /// `"[fe80::1%2]:5540"` -> `"fe80::1%2"`. This is what `ctx.addrs` stores and
 /// what `node_addresses` hands the controller (`"ip"` or `"ip%iface"`, no port).
 ///
-/// The bracket branch is checked first because a bare `rsplit_once(':')` would
-/// mangle an unbracketed IPv6 literal into everything-but-the-last-group.
+/// One line, because the logic itself lives in `controller::addr` and is shared
+/// with `commands::commissioning`, which needs the port half as well. It used to
+/// be two independent copies, and that cost two bugs fixed twice each (see the
+/// module docs over there). The tests below stayed here: they are the ones that
+/// pin the shapes *this* crate feeds it.
 pub(crate) fn ip_of(addr: &str) -> String {
-    if let Some(rest) = addr.strip_prefix('[') {
-        // Bracketed: the host is exactly what is inside the brackets, whether or
-        // not a `:port` follows.
-        return match rest.split_once(']') {
-            Some((host, _)) => host.to_string(),
-            // Unterminated bracket: not something rs-matter produces, but
-            // returning the remainder beats returning the `[`.
-            None => rest.to_string(),
-        };
-    }
-
-    // Unbracketed. More than one colon means an IPv6 literal written without
-    // brackets, which therefore cannot carry a port — take it whole.
-    if addr.matches(':').count() > 1 {
-        return addr.to_string();
-    }
-
-    match addr.rsplit_once(':') {
-        Some((host, _)) => host.to_string(),
-        None => addr.to_string(),
-    }
+    matter_rs_controller::addr::ip_of(addr)
 }
 
 #[cfg(test)]

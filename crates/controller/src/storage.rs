@@ -156,16 +156,53 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
     }
 }
 
+/// Distinguishes concurrent writers *inside* this process.
+///
+/// The pid alone is not enough. Two tasks writing config.json at the same time
+/// (two WS connections: HA plus a debug client, or a reconnect while the old
+/// connection still drains) would open the same `.config.json.tmp-<pid>` with
+/// `truncate(true)`, interleave their `to_writer_pretty` output — unbuffered,
+/// many small writes straight onto a `&File` — and both rename. The survivor can
+/// be invalid JSON, which `load_config` then *silently* reads back as
+/// `ConfigData::default()`: no fabric label, no WiFi/Thread credentials, and a
+/// reset `next_node_id`, with one `warn!` as the only trace.
+///
+/// `MatterController::update_config` serializes the config read-modify-write as
+/// well; this counter is the belt to that braces, and it also covers two writers
+/// aimed at *different* files, which no single lock does.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T, secret: bool) -> io::Result<()> {
-    let dir = path.parent().unwrap();
+    // No unwraps on the boot path: a path without a parent or a final component
+    // cannot be written atomically here, and that has to surface as an error
+    // rather than a panic even though every caller passes a well-formed path.
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{path:?} has no parent directory or file name to write atomically"),
+        ));
+    };
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(
-        ".{}.tmp-{}", path.file_name().unwrap().to_string_lossy(), std::process::id()));
+        ".{}.tmp-{}-{seq}", name.to_string_lossy(), std::process::id()));
+    let result = write_tmp_then_rename(&tmp, path, value, secret);
+    if result.is_err() {
+        // Without this a read-only or full disk leaves one `.name.tmp-pid-seq`
+        // behind per attempt, forever, next to the file it failed to replace.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn write_tmp_then_rename<T: Serialize>(
+    tmp: &Path, path: &Path, value: &T, secret: bool,
+) -> io::Result<()> {
     {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
         if secret { use std::os::unix::fs::OpenOptionsExt; opts.mode(0o600); }
-        let file = opts.open(&tmp)?;
+        let file = opts.open(tmp)?;
         serde_json::to_writer_pretty(&file, value)?;
         file.sync_all()?;
     }
@@ -173,9 +210,9 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T, secret: bool) -> io::
     if secret {
         use std::os::unix::fs::PermissionsExt;
         // OpenOptions mode only applies on create; enforce on every write.
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(0o600))?;
     }
-    std::fs::rename(&tmp, path)
+    std::fs::rename(tmp, path)
 }
 
 /// Node-server compatible: trim; None/empty -> "HomeAssistant"; hard substring(0,32).
@@ -301,6 +338,55 @@ mod tests {
         assert_eq!(s.load_config().fabric_label, ConfigData::default().fabric_label);
         std::fs::write(d.path().join("nodes").join("9.json"), b"{ not json").unwrap();
         assert!(s.load_nodes().is_empty());
+    }
+
+    /// Every writer needs its OWN temp path. Sharing `.config.json.tmp-<pid>`
+    /// means two threads both open it with `truncate(true)`, interleave their
+    /// unbuffered `to_writer_pretty` output, and both rename — so the file that
+    /// survives can be invalid JSON, which `load_config` then *silently* answers
+    /// as `ConfigData::default()`: no credentials, no fabric label, reset
+    /// `next_node_id`. Threads rather than tasks because threads are the shape
+    /// that collides.
+    #[test]
+    fn concurrent_writers_never_leave_a_torn_config() {
+        let d = tmp();
+        let s = Storage::open(d.path()).unwrap();
+        std::thread::scope(|scope| {
+            let s = &s;
+            for w in 0..4 {
+                scope.spawn(move || {
+                    for i in 0..50u64 {
+                        let mut cfg = ConfigData::default();
+                        cfg.fabric_label = format!("writer{w}");
+                        cfg.next_node_id = 1000 + i;
+                        s.save_config(&cfg).expect("atomic write must not fail");
+                        // Any intermediate state must still parse: a torn file
+                        // comes back as the default label instead.
+                        let back = s.load_config();
+                        assert!(back.fabric_label.starts_with("writer"), "torn config.json: {back:?}");
+                        assert!(back.next_node_id >= 1000, "torn config.json: {back:?}");
+                    }
+                });
+            }
+        });
+    }
+
+    /// A failed write must not leave `.name.tmp-pid-seq` litter next to the file
+    /// it did not replace (one per attempt, forever, on a full or read-only disk).
+    #[test]
+    fn a_failed_atomic_write_removes_its_temp_file() {
+        let d = tmp();
+        // serde_json rejects a non-string map key, and it does so *after* the
+        // temp file exists — exactly the path that used to leak it.
+        let unserializable: BTreeMap<(u8, u8), u8> = [((1, 2), 3)].into_iter().collect();
+        let path = d.path().join("bad.json");
+        assert!(write_json_atomic(&path, &unserializable, false).is_err());
+        assert!(!path.exists());
+        let litter: Vec<String> = std::fs::read_dir(d.path()).unwrap().flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(litter.is_empty(), "left temp litter behind: {litter:?}");
     }
 
     #[test]

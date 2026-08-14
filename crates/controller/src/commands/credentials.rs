@@ -4,10 +4,25 @@
 
 use serde_json::{json, Map, Value};
 
+use matter_rs_wire::error::ServerErrorCode;
+
 use crate::api::CommandError;
-use crate::commands::{invalid, opt_str, require_str};
+use crate::commands::{err, invalid, opt_str, require_str};
 use crate::real::MatterController;
 use crate::storage::{validate_credential_id, validate_thread_dataset, WifiCredential};
+
+/// A credential mutation that could not be written to `config.json` must not
+/// report success: the value is live for this process run but gone after the
+/// next restart, and a client that was told "ok" has no way to learn that.
+/// `set_wifi_credentials` on a full or read-only disk is the case that matters —
+/// the credential is what every later commissioning depends on.
+///
+/// `UnknownError` (0) because no wire code names a storage failure; it is the
+/// unexpected-internal-failure bucket, which is also where the Node server's
+/// synchronous write would land if it threw.
+fn persist_err(e: std::io::Error) -> CommandError {
+    err(ServerErrorCode::UnknownError, format!("could not persist config.json: {e}"))
+}
 
 pub async fn set_wifi(c: &MatterController, args: &Map<String, Value>) -> Result<Value, CommandError> {
     let ssid = require_str(args, "ssid")?.to_string();
@@ -29,7 +44,10 @@ pub async fn set_wifi(c: &MatterController, args: &Map<String, Value>) -> Result
     } else {
         credentials
     };
-    c.update_config(|cfg| { cfg.wifi_credentials.insert(id, WifiCredential { ssid, password }); });
+    let (_, persisted) = c.update_config(|cfg| {
+        cfg.wifi_credentials.insert(id, WifiCredential { ssid, password });
+    }).await;
+    persisted.map_err(persist_err)?;
     c.broadcast_server_info_updated();
     Ok(json!({}))
 }
@@ -41,21 +59,24 @@ pub async fn set_thread(c: &MatterController, args: &Map<String, Value>) -> Resu
 
     let cfg = c.config_snapshot();
     validate_credential_id(&id, cfg.thread_datasets.keys().cloned()).map_err(invalid)?;
-    c.update_config(|cfg| { cfg.thread_datasets.insert(id, dataset); });
+    let (_, persisted) = c.update_config(|cfg| { cfg.thread_datasets.insert(id, dataset); }).await;
+    persisted.map_err(persist_err)?;
     c.broadcast_server_info_updated();
     Ok(json!({}))
 }
 
 pub async fn remove_wifi(c: &MatterController, args: &Map<String, Value>) -> Result<Value, CommandError> {
     let id = opt_str(args, "id").unwrap_or("default").to_string();
-    c.update_config(|cfg| { cfg.wifi_credentials.remove(&id); });
+    let (_, persisted) = c.update_config(|cfg| { cfg.wifi_credentials.remove(&id); }).await;
+    persisted.map_err(persist_err)?;
     c.broadcast_server_info_updated();
     Ok(json!({}))
 }
 
 pub async fn remove_thread(c: &MatterController, args: &Map<String, Value>) -> Result<Value, CommandError> {
     let id = opt_str(args, "id").unwrap_or("default").to_string();
-    c.update_config(|cfg| { cfg.thread_datasets.remove(&id); });
+    let (_, persisted) = c.update_config(|cfg| { cfg.thread_datasets.remove(&id); }).await;
+    persisted.map_err(persist_err)?;
     c.broadcast_server_info_updated();
     Ok(json!({}))
 }
