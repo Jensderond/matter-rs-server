@@ -40,17 +40,20 @@ pub fn identity_from_preserved_ca(
 ) -> Result<ServerIdentity, StackError> {
     let crypto = default_crypto(rand::thread_rng(), DAC_PRIVKEY);
 
-    // Fail fast on self-inconsistency: NocGenerator takes the fabric id from
-    // the RCAC, so a mismatch here would otherwise surface later as
-    // self-check 1 failing with no hint of why. This is also where a DER blob
-    // in rootCertBytes dies, with the certificate named as the problem.
+    // Fail fast on self-inconsistency: a FabricId RDN in the RCAC's subject
+    // must agree with the requested fabric id, or self-check 1 would fail
+    // later with no hint of why. This is also where a DER blob in
+    // rootCertBytes dies, with the certificate named as the problem.
     //
     // A real matter.js RCAC parses fine but carries NO FabricId in its
     // subject DN at all (verified in matter.js v0.17.9's
-    // CertificateAuthority.ts: RCAC `subject: { rcacId }` only). That is a
-    // different failure than "not a cert", so `get_fabric_id()` erroring is
-    // disambiguated against `get_ca_id()` on the same cert before either is
-    // reported as a parse failure.
+    // CertificateAuthority.ts: RCAC `subject: { rcacId }` only) — spec-legal,
+    // and the expected shape for a migrated store. `get_fabric_id()` erroring
+    // is therefore disambiguated against `get_ca_id()` on the same cert: a
+    // cert that merely omits the RDN proceeds (the fabric id comes from the
+    // caller, and `NocGenerator::create_with_fabric_id` mirrors the root's
+    // actual subject shape in the NOC's issuer DN); only a cert that yields
+    // neither is reported as a parse failure.
     let cert_ref = CertRef::new(TLVElement::new(rcac_tlv));
     match cert_ref.get_fabric_id() {
         Ok(rcac_fabric_id) if rcac_fabric_id == fabric_id => {}
@@ -61,19 +64,10 @@ pub fn identity_from_preserved_ca(
             ));
         }
         Err(e) => {
-            if cert_ref.get_ca_id().is_ok() {
-                return Err(StackError::new(
-                    StackErrorKind::Sdk,
-                    "the preserved RCAC carries no FabricId in its subject DN — the normal \
-                     matter.js shape. rs-matter's NocGenerator cannot yet mint a controller NOC \
-                     whose issuer DN mirrors such a root (devices validate the NOC's issuer DN \
-                     against the root's subject DN, so a mismatched mint would be rejected at \
-                     CASE). Migration of this store is blocked on an rs-matter change; see the \
-                     spec's Risks section."
-                        .to_string(),
-                ));
+            if cert_ref.get_ca_id().is_err() {
+                return Err(sdk_err("rcac_tlv does not parse as a Matter TLV certificate", e));
             }
-            return Err(sdk_err("rcac_tlv does not parse as a Matter TLV certificate", e));
+            // FabricId-less root (the matter.js shape): fine, proceed.
         }
     }
 
@@ -97,8 +91,14 @@ pub fn identity_from_preserved_ca(
         .map_err(|e| sdk_err("serialising the controller key", e))?;
 
     let mut noc_buf = [0u8; MAX_CERT_TLV_AND_ASN1_LEN];
-    let mut noc_gen = NocGenerator::create(ca_key.reference(), rcac_tlv, &[], &mut noc_buf)
-        .map_err(|e| sdk_err("preparing the NOC generator over the preserved CA", e))?;
+    // `create_with_fabric_id`, not `create`: the plain constructor demands a
+    // FabricId RDN of the RCAC's subject, which migrated matter.js roots do
+    // not carry. This one takes the id from the caller (validated against the
+    // RDN when present) and mints NOCs whose issuer DN mirrors the root's
+    // actual subject shape — which is what devices validate against.
+    let mut noc_gen =
+        NocGenerator::create_with_fabric_id(ca_key.reference(), rcac_tlv, &[], fabric_id, &mut noc_buf)
+            .map_err(|e| sdk_err("preparing the NOC generator over the preserved CA", e))?;
     let controller_noc = noc_gen
         .generate(&crypto, csr, node_id, &[], VALID_FOREVER)
         .map_err(|e| sdk_err("minting the controller NOC", e))?;
@@ -220,6 +220,25 @@ pub fn generate_ca(fabric_id: u64) -> Result<(Vec<u8>, Vec<u8>), StackError> {
     Ok((ca_key.access().to_vec(), rcac))
 }
 
+/// Fixture/test helper: a fresh CA in the **matter.js shape** — subject DN
+/// carries the RCAC id but **no FabricId RDN** (spec-legal, and what every
+/// real migrated store holds; verified in matter.js v0.17.9's
+/// `CertificateAuthority.ts`). Unlike [`generate_ca`] the serial number is a
+/// single draw, not redrawn until DER-canonical — matter.js roots are random
+/// draws too, so this is the faithful shape for migration fixtures (the
+/// server's boot-time serial warning is expected and harmless for them).
+pub fn generate_ca_without_fabric_id() -> Result<(Vec<u8>, Vec<u8>), StackError> {
+    use rs_matter::onboard::cac::RcacGenerator;
+
+    let crypto = default_crypto(rand::thread_rng(), DAC_PRIVKEY);
+    let mut buf = [0u8; MAX_CERT_TLV_AND_ASN1_LEN];
+    let mut gen = RcacGenerator::new(&mut buf);
+    let (ca_key, rcac) = gen
+        .generate_without_fabric_id(&crypto, VALID_FOREVER)
+        .map_err(|e| sdk_err("generating a FabricId-less CA", e))?;
+    Ok((ca_key.access().to_vec(), rcac.to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,36 +346,45 @@ mod tests {
     /// 0x18                 end of struct
     /// ```
     ///
-    /// No FabricId (tag 21) DN entry is present, and no other cert field
-    /// (serial, issuer, signature, ...) is needed — neither `get_fabric_id`
-    /// nor `get_ca_id` reads past the subject list.
-    fn rcac_with_ca_id_but_no_fabric_id() -> Vec<u8> {
-        vec![0x15, 0x37, 0x06, 0x24, 0x14, 0x01, 0x18, 0x18]
-    }
-
+    /// The real matter.js root shape (subject DN: RCAC id only, no FabricId)
+    /// must mint a complete, verifiable identity — this was the migration's
+    /// one confirmed blocker, fixed by the rs-matter fork's
+    /// `create_with_fabric_id` + issuer-DN mirroring.
     #[test]
-    fn a_fabricid_less_matterjs_rcac_gets_a_precise_diagnosis_not_a_parse_error() {
-        let (ca_key, _) = generate_ca(1).unwrap();
-        let rcac = rcac_with_ca_id_but_no_fabric_id();
+    fn a_fabricid_less_matterjs_rcac_mints_a_verifiable_identity() {
+        let (ca_key, rcac) = generate_ca_without_fabric_id().unwrap();
 
-        // Sanity: the cert really does parse (get_ca_id succeeds) but really
-        // does lack a FabricId (get_fabric_id fails) — otherwise this test
-        // would not be exercising the branch it claims to.
+        // Sanity: the fixture really is the matter.js shape — parses as a
+        // cert (get_ca_id) but carries no FabricId (get_fabric_id errors).
         let cert_ref = CertRef::new(TLVElement::new(&rcac));
-        assert!(cert_ref.get_ca_id().is_ok(), "test fixture must parse as a cert");
-        assert!(cert_ref.get_fabric_id().is_err(), "test fixture must lack a FabricId");
+        assert!(cert_ref.get_ca_id().is_ok(), "fixture must parse as a cert");
+        assert!(cert_ref.get_fabric_id().is_err(), "fixture must lack a FabricId");
 
-        let err = identity_from_preserved_ca(&ca_key, &rcac, 1, 0xFFF1, 112233, &EPOCH_KEY).unwrap_err();
+        let id = identity_from_preserved_ca(&ca_key, &rcac, 1, 0xFFF1, 112233, &EPOCH_KEY).unwrap();
+        assert_eq!(id.fabric_id, 1);
+        assert_eq!(id.controller_node_id, 112233);
+        assert_ne!(id.compressed_fabric_id, 0);
+        assert_eq!(id.rcac_tlv, rcac);
+        // Chain verification passes: the NOC's issuer DN mirrors this root's
+        // FabricId-less subject, and the signature chains to it.
+        verify_identity(&id).unwrap();
+
+        // The NOC's issuer DN really is FabricId-less on the wire (DN context
+        // tag 21) — the exact bytes a device compares against its stored
+        // root's subject DN.
+        let issuer = TLVElement::new(&id.controller_noc_tlv)
+            .structure()
+            .unwrap()
+            .find_ctx(3)
+            .unwrap();
         assert!(
-            err.message.contains("no FabricId in its subject DN"),
-            "unhelpful error: {}",
-            err.message
+            issuer.list().unwrap().find_ctx(21).unwrap().is_empty(),
+            "the minted NOC's issuer DN must not carry a FabricId this root's subject lacks"
         );
-        assert!(
-            !err.message.contains("does not parse"),
-            "a fabricId-less-but-parseable RCAC must not be reported as unparseable: {}",
-            err.message
-        );
+
+        // Deterministic fabric identity, same as the fabric-ful path.
+        let again = identity_from_preserved_ca(&ca_key, &rcac, 1, 0xFFF1, 112233, &EPOCH_KEY).unwrap();
+        assert_eq!(again.compressed_fabric_id, id.compressed_fabric_id);
     }
 
     #[test]

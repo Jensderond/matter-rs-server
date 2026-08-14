@@ -7,7 +7,12 @@ license.workspace = true
 [dependencies]
 matter-rs-controller = { path = "../controller" }
 matter-rs-gen = { path = "../gen" }
-rs-matter = { git = "https://github.com/project-chip/rs-matter", rev = "03bc8f2aeb7765a93e7863e2263f73c7bbc3d401", features = ["async-io", "max-sessions-32", "case-resumption"] }
+# Jens's fork = upstream 03bc8f2 + one additive commit (NocGenerator::
+# create_with_fabric_id / issuer-DN mirroring + RcacGenerator::
+# generate_without_fabric_id), needed to mint NOCs against migrated matter.js
+# roots, whose subject DN legally omits the FabricId RDN. Candidate for an
+# upstream PR; repoint at project-chip once merged there.
+rs-matter = { git = "https://github.com/Jensderond/rs-matter", rev = "405064b63d152020c76e182d782e5d45e7eb1c0c", features = ["async-io", "max-sessions-32", "case-resumption"] }
 embassy-futures = "0.1"
 embassy-time = { version = "0.5", features = ["std"] }
 embassy-time-queue-utils = { version = "0.3", features = ["generic-queue-64"] }

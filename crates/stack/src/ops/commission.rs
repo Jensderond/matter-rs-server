@@ -49,11 +49,31 @@ pub(crate) async fn commission<C: Crypto>(
     // 2. A NocGenerator over the persisted CA. RCAC-direct: the signer *is* the
     //    root key and the ICAC is empty, because matter.js rejects rs-matter's
     //    ICAC (spike finding 1).
+    //
+    //    `create_with_fabric_id`, not `create`: a fabric migrated from
+    //    matter.js has an RCAC whose subject DN legally omits the FabricId
+    //    RDN, which the plain constructor rejects — and the device NOCs it
+    //    mints must mirror the root's actual subject shape in their issuer DN
+    //    either way. The RCAC's own RDN still wins when present (exactly what
+    //    `create` always read — the stored scalar is warn-only on mismatch,
+    //    see `identity::install`); the scalar is only the fallback for the
+    //    FabricId-less migrated shape, where it equals the fabric id the
+    //    controller NOC's subject carries.
     let ca_key = crate::identity::canon_secret_key(&ctx.identity.ca_private_key).map_err(map_err)?;
+    let noc_fabric_id = rs_matter::cert::CertRef::new(rs_matter::tlv::TLVElement::new(
+        &ctx.identity.rcac_tlv,
+    ))
+    .get_fabric_id()
+    .unwrap_or(ctx.identity.fabric_id);
     let mut noc_buf = [0u8; MAX_CERT_TLV_AND_ASN1_LEN];
-    let mut noc_generator =
-        NocGenerator::create(ca_key.reference(), &ctx.identity.rcac_tlv, &[], &mut noc_buf)
-            .map_err(map_err)?;
+    let mut noc_generator = NocGenerator::create_with_fabric_id(
+        ca_key.reference(),
+        &ctx.identity.rcac_tlv,
+        &[],
+        noc_fabric_id,
+        &mut noc_buf,
+    )
+    .map_err(map_err)?;
     let mut commissioner_buf = [0u8; MAX_CERT_TLV_LEN];
     let mut commissioner = Commissioner::new(
         ctx.matter,

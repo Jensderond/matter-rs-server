@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use matter_rs_controller::storage::Storage;
 use matter_rs_migrate::{run, Options};
 use matter_rs_stack::migration::{
-    derive_operational_ipk, generate_ca, identity_from_preserved_ca, rcac_public_key,
+    derive_operational_ipk, generate_ca, generate_ca_without_fabric_id,
+    identity_from_preserved_ca, rcac_public_key,
 };
 use serde_json::{json, Value};
 
@@ -92,7 +93,20 @@ fn upd_line(key: &str, values: Value) -> String {
 /// Build the whole store under `root`. ~40k WAL lines; runs in well under a
 /// second in release-test, a few seconds in debug — acceptable for the gate.
 fn build_fixture(root: &Path) -> Fixture {
-    let (ca_private_key, rcac_tlv) = generate_ca(1).unwrap();
+    build_fixture_with_ca(root, generate_ca(1).unwrap())
+}
+
+/// The REAL matter.js CA shape: subject DN carries no FabricId RDN (verified
+/// against matter.js v0.17.9's `CertificateAuthority.ts`). This variant is
+/// what an actual migrated store holds — the fabric-ful shape above cannot
+/// reproduce it, which is exactly how the fabricId-less blocker once slipped
+/// past this whole suite.
+fn build_matterjs_shaped_fixture(root: &Path) -> Fixture {
+    build_fixture_with_ca(root, generate_ca_without_fabric_id().unwrap())
+}
+
+fn build_fixture_with_ca(root: &Path, ca: (Vec<u8>, Vec<u8>)) -> Fixture {
+    let (ca_private_key, rcac_tlv) = ca;
     let minted =
         identity_from_preserved_ca(&ca_private_key, &rcac_tlv, 1, 0xFFF1, 112233, &EPOCH_KEY).unwrap();
     let f = Fixture {
@@ -265,6 +279,39 @@ fn write_produces_a_store_the_server_code_reads_back() {
     }
     // The commitId boundary held: the poison-pill label never surfaced.
     assert_ne!(cfg.fabric_label, "resurrected");
+}
+
+/// The same end-to-end gate over the REAL matter.js CA shape (no FabricId in
+/// the root's subject DN). This is the regression test for the migration's
+/// one confirmed blocker: minting an identity from such a root requires the
+/// forked rs-matter's `create_with_fabric_id` + issuer-DN mirroring, and the
+/// fabric-ful fixture above can never exercise it.
+#[test]
+fn a_matterjs_shaped_ca_migrates_end_to_end() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    let to = dst.path().join("matter-rs");
+    let f = build_matterjs_shaped_fixture(src.path());
+    let before = dir_inventory(src.path());
+
+    let report = run(&Options { from: src.path().into(), to: to.clone(), write: true }).unwrap();
+    assert!(report.ok(), "checks failed on the matter.js-shaped store:\n{report}");
+    assert_eq!(dir_inventory(src.path()), before, "the source store was modified");
+
+    let storage = Storage::open(&to).unwrap();
+    let id = storage.load_identity().unwrap().expect("server.json must exist");
+    assert_eq!(id.fabric_id, 1);
+    assert_eq!(id.controller_node_id, 112233);
+    assert_eq!(id.compressed_fabric_id, f.compressed_fabric_id);
+    assert_eq!(id.rcac_tlv, f.rcac_tlv, "the preserved root must be stored verbatim");
+    matter_rs_stack::migration::verify_identity(&id)
+        .expect("the minted NOC must chain to the FabricId-less root");
+
+    // All five nodes, with the same fail-safe fabric-index outcomes.
+    let nodes = storage.load_nodes();
+    assert_eq!(nodes.iter().map(|n| n.node_id).collect::<Vec<_>>(), vec![10, 12, 21, 22, 23]);
+    assert_eq!(nodes.iter().find(|n| n.node_id == 10).unwrap().device_fabric_index, 3);
+    assert_eq!(nodes.iter().find(|n| n.node_id == 23).unwrap().device_fabric_index, 0);
 }
 
 #[test]

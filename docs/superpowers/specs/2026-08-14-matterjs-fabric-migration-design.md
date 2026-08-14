@@ -345,20 +345,22 @@ Every failure must leave both stores usable.
   `<compressedFabricId>.json`, `certificates/`, `credentials/`). They are
   irrelevant to this tool but will mislead a reader into thinking the CHIP files
   are the source of truth. The tool should ignore them and say so.
-- **CONFIRMED BLOCKER (final review, 2026-08-14): matter.js RCACs carry no
-  FabricId in their subject DN** (`CertificateAuthority.ts`, v0.17.9: RCAC
-  `subject: { rcacId }` only; its NOCs get `issuer: { rcacId }`). rs-matter's
-  `NocGenerator::create` hard-requires `get_fabric_id()` on the RCAC and stamps
-  the NOC's issuer DN as `{ca_id, fabric_id}` — and devices validate a NOC's
-  issuer DN against their stored root's subject DN, so a mismatched mint would
-  be rejected at CASE even if the requirement were relaxed. The DN types are
-  `pub(crate)` in rs-matter, so no fix is possible from this repo alone: minting
-  needs an rs-matter change (a `NocGenerator` entry point that takes the fabric
-  id from the caller and mirrors the issuer DN from the RCAC's actual subject).
-  Until then the tool detects the shape and refuses with a precise error;
-  nothing is written. The server's own post-migration commissioning path
-  (`identity.rs` → `NocGenerator::create` over the stored RCAC) shares the
-  constraint, so the "still commission new ones" claim above is suspended until
-  the same fix lands. The rs-matter fixture in `crates/migrate` cannot
-  reproduce this shape (RcacGenerator always writes a FabricId), so the
-  regression test must follow the rs-matter change.
+- **RESOLVED blocker (found in final review, fixed 2026-08-14): matter.js
+  RCACs carry no FabricId in their subject DN** (`CertificateAuthority.ts`,
+  v0.17.9: RCAC `subject: { rcacId }` only; its NOCs get
+  `issuer: { rcacId }`). rs-matter's `NocGenerator::create` hard-required
+  `get_fabric_id()` on the RCAC and stamped the NOC's issuer DN as
+  `{ca_id, fabric_id}` — and devices validate a NOC's issuer DN against their
+  stored root's subject DN, so a mismatched mint would be rejected at CASE.
+  The DN types are `pub(crate)` in rs-matter, so the fix lives in **Jens's
+  fork** (`Jensderond/rs-matter`, branch `noc-issuer-dn-mirroring`, one
+  additive commit atop the previously pinned upstream rev, now what
+  `crates/stack` pins): `NocGenerator::create_with_fabric_id` takes the fabric
+  id from the caller (validated against the RDN when present) and mirrors the
+  issuer DN from the signing cert's actual subject;
+  `RcacGenerator::generate_without_fabric_id` mints the shape for fixtures.
+  The tool and the server's post-migration commissioning path
+  (`ops::commission`) both use the new entry point, un-suspending the "still
+  commission new ones" claim, and the `crates/migrate` integration gate now
+  runs end-to-end over a matter.js-shaped CA as the regression test.
+  Candidate for an upstream PR; repoint at project-chip once merged.
