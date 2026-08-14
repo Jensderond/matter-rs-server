@@ -3,12 +3,16 @@ use serde_json::{json, Map, Value};
 use matter_rs_wire::error::ServerErrorCode;
 
 use crate::api::CommandError;
-use crate::commands::{err, invalid, opt_bool, opt_u64, require_str, require_u64, stack_err};
+use crate::commands::{err, invalid, narrow, opt_bool, opt_u64, require_str, require_u64, stack_err};
 use crate::real::MatterController;
 use crate::stack_api::AttributePathSpec;
 
 /// Node splitAttributePath: decimal segments; non-numeric OR the sentinels
 /// 0xffff (endpoint) / 0xffffffff (cluster, attribute) mean wildcard.
+///
+/// A segment that parses but does not fit its id width is an error, never a
+/// truncation: `"70000/6/0"` used to read (and via `write_attribute`, write)
+/// endpoint 4464.
 pub fn parse_attribute_path(path: &str) -> Result<AttributePathSpec, CommandError> {
     let parts: Vec<&str> = path.split('/').collect();
     if parts.len() != 3 {
@@ -22,9 +26,12 @@ pub fn parse_attribute_path(path: &str) -> Result<AttributePathSpec, CommandErro
         }
     };
     Ok(AttributePathSpec {
-        endpoint: seg(parts[0], 0xFFFF).map(|n| n as u16),
-        cluster: seg(parts[1], 0xFFFF_FFFF).map(|n| n as u32),
-        attribute: seg(parts[2], 0xFFFF_FFFF).map(|n| n as u32),
+        endpoint: seg(parts[0], 0xFFFF)
+            .map(|n| narrow(n, &format!("endpoint id in attribute path {path:?}"))).transpose()?,
+        cluster: seg(parts[1], 0xFFFF_FFFF)
+            .map(|n| narrow(n, &format!("cluster id in attribute path {path:?}"))).transpose()?,
+        attribute: seg(parts[2], 0xFFFF_FFFF)
+            .map(|n| narrow(n, &format!("attribute id in attribute path {path:?}"))).transpose()?,
     })
 }
 
@@ -71,11 +78,16 @@ pub async fn write_attribute(c: &MatterController, args: &Map<String, Value>) ->
 pub async fn device_command(c: &MatterController, args: &Map<String, Value>) -> Result<Value, CommandError> {
     let node_id = require_u64(args, "node_id")?;
     c.ensure_node(node_id)?;
-    let endpoint = require_u64(args, "endpoint_id")? as u16;
-    let cluster = require_u64(args, "cluster_id")? as u32;
+    let endpoint: u16 = narrow(require_u64(args, "endpoint_id")?, "endpoint_id")?;
+    let cluster: u32 = narrow(require_u64(args, "cluster_id")?, "cluster_id")?;
     let command_name = require_str(args, "command_name")?.to_string();
     let payload = args.get("payload").cloned().unwrap_or_else(|| json!({}));
-    let timed_ms = opt_u64(args, "timed_request_timeout_ms").map(|v| v as u16);
+    // Truncating this one is survivable today — `ops::interact::normalize_timed`
+    // filters `Some(0)`, so a 65536 that landed as 0 degrades to the 10s default
+    // rather than sending an already-expired request — but it is still silently
+    // not the budget the client asked for.
+    let timed_ms: Option<u16> = opt_u64(args, "timed_request_timeout_ms")
+        .map(|v| narrow(v, "timed_request_timeout_ms")).transpose()?;
     c.stack.invoke(node_id, endpoint, cluster, command_name, payload, timed_ms).await
         .map_err(|e| stack_err(ServerErrorCode::SdkStackError, e))
 }
@@ -136,6 +148,42 @@ mod tests {
             "command_name": "toggle", "payload": {}})).await.unwrap();
         assert_eq!(v, serde_json::Value::Null);
         assert!(r.stack.calls().iter().any(|c| c == "invoke node=5 1/6 toggle timed=None"));
+    }
+
+    /// Important-2 regression: a segment that does not fit its id width is an
+    /// error, not a truncation. `70000 as u16` is 4464, so this used to be a
+    /// *successful* read of a different endpoint — and through `write_attribute`,
+    /// a successful write to one.
+    #[tokio::test]
+    async fn out_of_range_attribute_path_segments_are_rejected_not_truncated() {
+        let r = rig_with_nodes(vec![node_record(5)]);
+        *r.stack.read_response.lock().unwrap() = Some(Ok(vec![("1/6/0".into(), json!(true))]));
+        let e = call(&r, "read_attribute", json!({"node_id": 5, "attribute_path": "70000/6/0"}))
+            .await.unwrap_err();
+        assert_eq!(e.code.code(), 8);
+        assert_eq!(e.details, "endpoint id in attribute path \"70000/6/0\" out of range: 70000");
+        // Nothing was sent to the stack — the point is that no OTHER endpoint got
+        // read. (Not `calls().is_empty()`: the rig's supervisor kick-off task may
+        // have logged a `start_supervisor` by now.)
+        assert!(!r.stack.calls().iter().any(|c| c.starts_with("read ")));
+
+        // 0xffff/0xffffffff stay the wildcard sentinels, one below them still parses.
+        let e = call(&r, "write_attribute",
+            json!({"node_id": 5, "attribute_path": "1/4294967296/0", "value": 1})).await.unwrap_err();
+        assert_eq!(e.code.code(), 8);
+        assert!(e.details.starts_with("cluster id in attribute path"), "{}", e.details);
+        let v = call(&r, "write_attribute",
+            json!({"node_id": 5, "attribute_path": "65534/4294967294/0", "value": 1})).await.unwrap();
+        assert_eq!(v[0]["Path"]["EndpointId"], 65534);
+
+        // device_command's own two ids, and the timed-request budget.
+        let e = call(&r, "device_command", json!({"node_id": 5, "endpoint_id": 65536,
+            "cluster_id": 6, "command_name": "toggle"})).await.unwrap_err();
+        assert_eq!(e.details, "endpoint_id out of range: 65536");
+        let e = call(&r, "device_command", json!({"node_id": 5, "endpoint_id": 1,
+            "cluster_id": 6, "command_name": "toggle", "timed_request_timeout_ms": 65536}))
+            .await.unwrap_err();
+        assert_eq!(e.details, "timed_request_timeout_ms out of range: 65536");
     }
 
     #[tokio::test]
