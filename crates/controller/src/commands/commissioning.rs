@@ -13,9 +13,38 @@ use crate::real::MatterController;
 use crate::stack_api::{CommissionRequest, PaseTarget};
 use crate::storage::{allocate_node_id, format_node_date, NodeRecord};
 
-/// Splits "ip:port" into (ip, Some(port)); passes through unchanged (None
-/// port) if there's no colon.
+/// Splits `"ip:port"` into `(ip, Some(port))`, unwrapping the brackets an IPv6
+/// socket address carries; passes through unchanged (`None` port) when there is
+/// no port to strip.
+///
+/// The bracket branch has to come first. rs-matter renders an IPv6 peer as
+/// `"[fe80::1%14]:5540"`, and a bare `rsplit_once(':')` on that leaves the
+/// brackets on the host — which is what used to get persisted into
+/// `NodeRecord::addresses`, so `get_node_ip_addresses` (which cuts the scope id
+/// off at `%`) answered a client with the unclosed literal `"[fe80::1"` and
+/// `ping_node` handed `ping6` an address it cannot parse.
+///
+/// `stack::ops::ip_of` does the same job for the live-address path and the
+/// duplication is deliberate: `controller` cannot depend on `stack`, the
+/// dependency runs the other way.
 fn split_ip_port(address: &str) -> (String, Option<u16>) {
+    if let Some(rest) = address.strip_prefix('[') {
+        return match rest.split_once(']') {
+            // The host is exactly what the brackets held, whether or not a
+            // `:port` follows.
+            Some((host, tail)) => {
+                (host.to_string(), tail.strip_prefix(':').and_then(|p| p.parse().ok()))
+            }
+            // Unterminated bracket: not something rs-matter produces, but
+            // returning the remainder beats returning the `[`.
+            None => (rest.to_string(), None),
+        };
+    }
+    // Unbracketed. More than one colon means an IPv6 literal written without
+    // brackets, which therefore cannot carry a port — take it whole.
+    if address.matches(':').count() > 1 {
+        return (address.to_string(), None);
+    }
     match address.rsplit_once(':') {
         Some((ip, port)) => (ip.to_string(), port.parse().ok()),
         None => (address.to_string(), None),
@@ -199,6 +228,54 @@ mod tests {
         // node id advanced + persisted
         let e = call(&r, "get_node", json!({"node_id": 1})).await;
         assert!(e.is_ok());
+    }
+
+    /// Task 19's live-device finding: rs-matter hands back an IPv6 peer as
+    /// `"[fe80::1%14]:5540"`, and the brackets used to survive into the persisted
+    /// record — so once `get_node_ip_addresses` cut the scope id off at `%`, a
+    /// client got the unclosed literal `"[fe80::1"` and `ping_node` got something
+    /// `ping6` refuses. Asserted end-to-end (commission -> record -> command)
+    /// rather than only on the splitter, because the splitter's output is only
+    /// wrong in the way that matters once a reader trims it.
+    #[tokio::test]
+    async fn a_commissioned_ipv6_peer_is_recorded_without_its_brackets() {
+        let r = rig();
+        *r.stack.commission_response.lock().unwrap() = Some(Ok(CommissionOutcome {
+            device_fabric_index: 1,
+            address: "[fe80::87f:8d29:2561:f7fb%14]:5540".into(),
+        }));
+        *r.stack.interview_response.lock().unwrap() = Some(Ok(Default::default()));
+        call(&r, "commission_with_code", json!({"code": "MT:TEST"})).await.unwrap();
+
+        // No live addresses: a restarted process only has the stored record, which
+        // is exactly the case that exposed this.
+        *r.stack.addresses_response.lock().unwrap() = Some(Ok(vec![]));
+        let v = call(&r, "get_node_ip_addresses", json!({"node_id": 1})).await.unwrap();
+        assert_eq!(v, json!(["fe80::87f:8d29:2561:f7fb"]));
+        *r.stack.addresses_response.lock().unwrap() = Some(Ok(vec![]));
+        let v = call(&r, "get_node_ip_addresses", json!({"node_id": 1, "scoped": true})).await.unwrap();
+        assert_eq!(v, json!(["fe80::87f:8d29:2561:f7fb%14"]));
+    }
+
+    #[test]
+    fn split_ip_port_handles_every_address_form_rs_matter_produces() {
+        use super::split_ip_port;
+        let cases: &[(&str, (&str, Option<u16>))] = &[
+            ("192.168.1.60:5540", ("192.168.1.60", Some(5540))),
+            ("192.168.1.60", ("192.168.1.60", None)),
+            ("[fe80::1%14]:5540", ("fe80::1%14", Some(5540))),
+            ("[fd12::5]:5540", ("fd12::5", Some(5540))),
+            ("[fd12::5]", ("fd12::5", None)),
+            // Not shapes rs-matter emits, but they must not produce a `[` either.
+            ("[fd12::5", ("fd12::5", None)),
+            ("fe80::1", ("fe80::1", None)),
+            ("192.168.1.60:notaport", ("192.168.1.60", None)),
+        ];
+        for (input, (ip, port)) in cases {
+            let got = split_ip_port(input);
+            assert_eq!((got.0.as_str(), got.1), (*ip, *port), "for {input:?}");
+            assert!(!got.0.contains('['), "for {input:?}");
+        }
     }
 
     #[tokio::test]
