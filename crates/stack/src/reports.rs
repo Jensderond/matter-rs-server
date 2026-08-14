@@ -53,12 +53,22 @@ use crate::tlv_json;
 /// instance) must not discard every other attribute on the node.
 ///
 /// The non-obvious job is reassembling chunked lists. When a list attribute does
-/// not fit the remaining TX space, devices — rs-matter included, see
-/// `send_array_items` at `rs-matter-ref/rs-matter/src/im.rs:2123` — split it into
-/// N+1 `AttributeReportIB`s that all carry the *same* endpoint/cluster/attribute:
-/// first an empty array tagged `ListIndex = Null`, then one report per element
-/// tagged `ListIndex = Some(i)`. Keyed on the path alone they collapse
-/// last-wins, and a 40-entry `PartsList` arrives at the client as a bare integer.
+/// not fit the remaining TX space, devices split it into N+1
+/// `AttributeReportIB`s that all carry the *same* endpoint/cluster/attribute:
+/// first an empty array with **no `ListIndex` field at all** (a whole-value
+/// replace — this is also how an ordinary unchunked attribute arrives), then
+/// one report per element with `ListIndex` **present and `null`** (append).
+/// This is the spec's wire encoding, and it is *not* what
+/// `send_array_items` (`rs-matter-ref/rs-matter/src/im.rs:2131-2158`) looks
+/// like it does at a glance: that loop's own `attr.list_index` walks concrete
+/// indices `Some(0), Some(1), …`, but that field only selects which element
+/// to *read* from the underlying store. What actually reaches the wire is
+/// `AttrDetails::reply_path` (`rs-matter-ref/rs-matter/src/dm/types/attribute.rs:299-317`),
+/// which translates every concrete index to `Nullable::none()` (present,
+/// null) before it is serialized — the ground truth, and the thing to trust
+/// over the internal loop. Keyed on the path alone, and dispatched on the
+/// wrong half of that translation, appends collapse last-wins, and a
+/// 40-entry `PartsList` arrives at the client as a bare integer.
 #[derive(Debug, Default)]
 pub(crate) struct AttrAccumulator {
     /// Wire order is preserved; the index only exists to find the slot to merge
@@ -120,11 +130,15 @@ impl AttrAccumulator {
             };
 
             let key = format!("{e}/{cl}/{a}");
-            match list_index(&data.path) {
-                None => self.put(key, json),
-                Some(i) => {
+            match list_op(&data.path) {
+                ListOp::Replace => self.put(key, json),
+                ListOp::Append => {
                     self.saw_list_chunks = true;
-                    self.append(key, i, json, who);
+                    self.append(key, json, who);
+                }
+                ListOp::SetIndex(i) => {
+                    self.saw_list_chunks = true;
+                    self.set_index(key, i, json, who);
                 }
             }
         }
@@ -147,8 +161,13 @@ impl AttrAccumulator {
     }
 
     /// One element of a chunked list, appended to the array opened by the
-    /// preceding `ListIndex = Null` report.
-    fn append(&mut self, key: String, i: u16, json: Value, who: &str) {
+    /// preceding no-`ListIndex` report.
+    ///
+    /// No index accompanies an append (`list_op`'s doc — every appended
+    /// element is tagged `ListIndex = null` on the wire, never a concrete
+    /// number), so there is nothing to gap-check against: wire order is
+    /// append order, full stop.
+    fn append(&mut self, key: String, json: Value, who: &str) {
         let Some(&at) = self.index.get(&key) else {
             // No array to append to. Either the report is malformed, or — the
             // real case — this is a subscription report whose list started in a
@@ -156,8 +175,8 @@ impl AttrAccumulator {
             // `handle_report` call. Cross-message merging is not implemented, so
             // say so loudly instead of handing the client a truncated array.
             tracing::warn!(
-                "{who}: list element {i} for {key} has no array to append to; the list is \
-                 split across ReportData messages and is reported incomplete"
+                "{who}: list append for {key} has no array to append to; the list is split \
+                 across ReportData messages and is reported incomplete"
             );
             self.orphan_appends.push(key.clone());
             self.index.insert(key.clone(), self.out.len());
@@ -169,27 +188,53 @@ impl AttrAccumulator {
             return;
         };
         match &mut slot.1 {
-            Value::Array(arr) => {
-                // Indices run 0,1,2,… (`im.rs:2148`); a gap means an element was
-                // lost somewhere between the device and here.
-                if usize::from(i) != arr.len() {
-                    tracing::warn!(
-                        "{who}: list index gap on {}: expected {}, got {i}",
-                        slot.0,
-                        arr.len()
-                    );
-                }
-                arr.push(json);
-            }
+            Value::Array(arr) => arr.push(json),
             other => {
                 tracing::warn!(
-                    "{who}: list element {i} for {} arrived after a non-array value; restarting \
-                     the array",
+                    "{who}: list append for {} arrived after a non-array value; restarting the \
+                     array",
                     slot.0
                 );
                 *other = Value::Array(vec![json]);
             }
         }
+    }
+
+    /// Set element `i` of the array recorded for `key`, per the spec-legal but
+    /// rare "replace one element by index" report. Not what any chunker in
+    /// this codebase's test devices has been observed to send (see
+    /// `list_op`'s doc) — chunked lists always append via a null index — but
+    /// a concrete index is legal on the wire, so it must not be misread as an
+    /// append (which would silently shift every later element by one).
+    fn set_index(&mut self, key: String, i: u16, json: Value, who: &str) {
+        let at = match self.index.get(&key) {
+            Some(&at) => at,
+            None => {
+                self.index.insert(key.clone(), self.out.len());
+                self.out.push((key, Value::Array(Vec::new())));
+                self.out.len() - 1
+            }
+        };
+
+        let slot = &mut self.out[at];
+        if !matches!(slot.1, Value::Array(_)) {
+            tracing::warn!(
+                "{who}: indexed list element {i} for {} arrived after a non-array value; \
+                 restarting the array",
+                slot.0
+            );
+            slot.1 = Value::Array(Vec::new());
+        }
+        let Value::Array(arr) = &mut slot.1 else { unreachable!("just ensured above") };
+
+        let idx = usize::from(i);
+        if idx >= arr.len() {
+            // A concrete index ahead of the array's current end: pad with
+            // `null` rather than refusing the report, mirroring how a JSON
+            // array literal with a gap would be read back.
+            arr.resize(idx + 1, Value::Null);
+        }
+        arr[idx] = json;
     }
 
     pub fn into_pairs(self) -> Vec<(String, Value)> {
@@ -216,14 +261,42 @@ impl AttrAccumulator {
     }
 }
 
-/// `Some(i)` for a chunked-list element, `None` for a whole value.
+/// What an `AttributeDataIB`'s path says to do with its `Data`, per
+/// `AttrPath::list_index: Option<Nullable<u16>>` (`im/encoding/attr.rs:72`) —
+/// three wire states, three different actions.
 ///
-/// `AttrPath::list_index` is `Option<Nullable<u16>>`
-/// (`im/encoding/attr.rs:72`), so there are three states and only two meanings:
-/// field absent (an unchunked attribute) and field present-but-Null (the empty
-/// array that opens a chunked list) both mean "the whole value".
-fn list_index(path: &AttrPath) -> Option<u16> {
-    path.list_index.as_ref().and_then(|n| n.as_opt_ref()).copied()
+/// Ground truth is `AttrDetails::reply_path`
+/// (`rs-matter-ref/rs-matter/src/dm/types/attribute.rs:299-317`), the
+/// function that actually builds this path for the wire:
+/// - field **absent** → [`ListOp::Replace`]. Both an ordinary unchunked
+///   attribute and the empty array that opens a chunked list arrive this way
+///   (`reply_path`'s `Some(None) | None => None` arm folds its own
+///   "give me the whole list" request into the same absent field a scalar
+///   attribute gets).
+/// - field present, **null** → [`ListOp::Append`]. `reply_path`'s
+///   `Some(Some(_)) => Some(Nullable::none())` arm is the whole point: every
+///   concrete index `send_array_items` (`im.rs:2131-2158`) walks internally
+///   to pick which element to *read* is rewritten to null before it is
+///   serialized, so a real device's per-element chunk never carries a
+///   number — only the append signal.
+/// - field present, a **concrete index** → [`ListOp::SetIndex`]. Legal per
+///   spec (replace one element in place) but not what this codebase's list
+///   chunking ever emits — see above. Kept distinct from `Append` so a
+///   concrete index can never be misread as one, which would shift every
+///   later element by one instead of replacing where it lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListOp {
+    Replace,
+    Append,
+    SetIndex(u16),
+}
+
+fn list_op(path: &AttrPath) -> ListOp {
+    match path.list_index.as_ref().map(|n| n.as_opt_ref()) {
+        None => ListOp::Replace,
+        Some(None) => ListOp::Append,
+        Some(Some(&i)) => ListOp::SetIndex(i),
+    }
 }
 
 /// The `ReportDataHandler` the runtime registers via
@@ -470,7 +543,10 @@ mod tests {
     }
 
     /// The bug this whole accumulator exists for: 3 elements of `0/29/3` used to
-    /// collapse to the last one.
+    /// collapse to the last one. Wire shape per `list_op`'s doc: the opener
+    /// carries no `ListIndex` field at all, and every element after it carries
+    /// `ListIndex = null` — never a concrete number, which is the mistake a
+    /// prior version of this test (and the code it exercised) made.
     #[test]
     fn chunked_list_is_merged_back_into_an_array() {
         let empty = build(|w| {
@@ -483,25 +559,23 @@ mod tests {
 
         let bytes = report_bytes(
             &[
-                // ListIndex = Null opens the array.
+                // No ListIndex field: replaces with an empty array, opening the list.
+                AttrResp::Data(AttrData::new(None, path(0, 29, 3, None), TLVElement::new(&empty))),
+                // ListIndex = null, repeated: one append per element, never a
+                // concrete index.
                 AttrResp::Data(AttrData::new(
                     None,
                     path(0, 29, 3, Some(None)),
-                    TLVElement::new(&empty),
-                )),
-                AttrResp::Data(AttrData::new(
-                    None,
-                    path(0, 29, 3, Some(Some(0))),
                     TLVElement::new(&e0),
                 )),
                 AttrResp::Data(AttrData::new(
                     None,
-                    path(0, 29, 3, Some(Some(1))),
+                    path(0, 29, 3, Some(None)),
                     TLVElement::new(&e1),
                 )),
                 AttrResp::Data(AttrData::new(
                     None,
-                    path(0, 29, 3, Some(Some(2))),
+                    path(0, 29, 3, Some(None)),
                     TLVElement::new(&e2),
                 )),
             ],
@@ -514,13 +588,56 @@ mod tests {
         assert_eq!(acc.into_pairs(), vec![("0/29/3".to_string(), json!([11, 22, 33]))]);
     }
 
+    /// Priming (`supervisor::establish`) and the read/interview path
+    /// (`ops::interact::read_attributes`) both share one accumulator across
+    /// every chunk of a *whole* exchange, not just one `ReportData` message —
+    /// so a list opened in message 1 and appended to in message 2 must still
+    /// merge into one array, unlike `ReportSink`'s per-message accumulator
+    /// (documented at [`AttrAccumulator::append`]).
+    #[test]
+    fn a_list_opened_in_one_message_and_appended_to_in_the_next_still_merges() {
+        let empty = build(|w| {
+            w.start_array(&TLVTag::Anonymous).unwrap();
+            w.end_container().unwrap();
+        });
+        let items: Vec<Vec<u8>> =
+            (0u16..16).map(|i| build(|w| w.u32(&TLVTag::Anonymous, u32::from(i)).unwrap())).collect();
+
+        let msg1 = report_bytes(
+            &[
+                AttrResp::Data(AttrData::new(None, path(0, 29, 1, None), TLVElement::new(&empty))),
+                AttrResp::Data(AttrData::new(None, path(0, 29, 1, Some(None)), TLVElement::new(&items[0]))),
+                AttrResp::Data(AttrData::new(None, path(0, 29, 1, Some(None)), TLVElement::new(&items[1]))),
+            ],
+            true,
+        );
+        let msg2 = report_bytes(
+            &items[2..]
+                .iter()
+                .map(|item| {
+                    AttrResp::Data(AttrData::new(None, path(0, 29, 1, Some(None)), TLVElement::new(item)))
+                })
+                .collect::<Vec<_>>(),
+            false,
+        );
+
+        let mut acc = AttrAccumulator::default();
+        for bytes in [msg1, msg2] {
+            let elem = TLVElement::new(&bytes);
+            let report = ReportDataResp::from_tlv(&elem).expect("parse ReportData");
+            acc.absorb(&report, "test");
+        }
+        let expected: Vec<Value> = (0..16).map(Value::from).collect();
+        assert_eq!(acc.into_pairs(), vec![("0/29/1".to_string(), Value::Array(expected))]);
+    }
+
     #[test]
     fn list_element_without_an_opening_array_is_flagged_not_hidden() {
         let e0 = build(|w| w.u16(&TLVTag::Anonymous, 11).unwrap());
         let bytes = report_bytes(
             &[AttrResp::Data(AttrData::new(
                 None,
-                path(0, 29, 3, Some(Some(4))),
+                path(0, 29, 3, Some(None)),
                 TLVElement::new(&e0),
             ))],
             true,
@@ -529,6 +646,66 @@ mod tests {
         assert_eq!(acc.orphan_appends(), ["0/29/3"]);
         // The element still reaches the client rather than vanishing.
         assert_eq!(acc.into_pairs(), vec![("0/29/3".to_string(), json!([11]))]);
+    }
+
+    /// Requirement: a later whole-value replace (no `ListIndex` field) must
+    /// discard a previously chunked-and-merged array, not merge into it —
+    /// this is the normal way a small list's *next* value arrives once it no
+    /// longer needs chunking.
+    #[test]
+    fn a_later_full_replace_replaces_the_merged_array() {
+        let empty = build(|w| {
+            w.start_array(&TLVTag::Anonymous).unwrap();
+            w.end_container().unwrap();
+        });
+        let e0 = build(|w| w.u16(&TLVTag::Anonymous, 11).unwrap());
+        let replacement = build(|w| {
+            w.start_array(&TLVTag::Anonymous).unwrap();
+            w.u16(&TLVTag::Anonymous, 99).unwrap();
+            w.end_container().unwrap();
+        });
+
+        let bytes = report_bytes(
+            &[
+                AttrResp::Data(AttrData::new(None, path(0, 29, 3, None), TLVElement::new(&empty))),
+                AttrResp::Data(AttrData::new(
+                    None,
+                    path(0, 29, 3, Some(None)),
+                    TLVElement::new(&e0),
+                )),
+                // No ListIndex: a whole new value, unrelated to the array just built.
+                AttrResp::Data(AttrData::new(
+                    None,
+                    path(0, 29, 3, None),
+                    TLVElement::new(&replacement),
+                )),
+            ],
+            false,
+        );
+        assert_eq!(absorb(&bytes).into_pairs(), vec![("0/29/3".to_string(), json!([99]))]);
+    }
+
+    /// The rare, spec-legal "set element by concrete index" report — distinct
+    /// from an append, and must not be misread as one (which would shift
+    /// every later element by a position instead of landing where the index
+    /// says).
+    #[test]
+    fn concrete_index_sets_that_element_padding_gaps_with_null() {
+        let e5 = build(|w| w.u16(&TLVTag::Anonymous, 55).unwrap());
+        let bytes = report_bytes(
+            &[AttrResp::Data(AttrData::new(
+                None,
+                path(0, 29, 3, Some(Some(5))),
+                TLVElement::new(&e5),
+            ))],
+            false,
+        );
+        let acc = absorb(&bytes);
+        assert!(acc.orphan_appends().is_empty(), "a concrete index is not an append");
+        assert_eq!(
+            acc.into_pairs(),
+            vec![("0/29/3".to_string(), json!([null, null, null, null, null, 55]))]
+        );
     }
 
     #[test]
@@ -544,14 +721,10 @@ mod tests {
         let bytes = report_bytes(
             &[
                 AttrResp::Data(AttrData::new(None, path(0, 40, 1, None), TLVElement::new(&a))),
+                AttrResp::Data(AttrData::new(None, path(0, 29, 3, None), TLVElement::new(&empty))),
                 AttrResp::Data(AttrData::new(
                     None,
                     path(0, 29, 3, Some(None)),
-                    TLVElement::new(&empty),
-                )),
-                AttrResp::Data(AttrData::new(
-                    None,
-                    path(0, 29, 3, Some(Some(0))),
                     TLVElement::new(&e0),
                 )),
                 AttrResp::Data(AttrData::new(None, path(0, 40, 2, None), TLVElement::new(&z))),
