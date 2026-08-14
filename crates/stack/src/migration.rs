@@ -44,14 +44,37 @@ pub fn identity_from_preserved_ca(
     // the RCAC, so a mismatch here would otherwise surface later as
     // self-check 1 failing with no hint of why. This is also where a DER blob
     // in rootCertBytes dies, with the certificate named as the problem.
-    let rcac_fabric_id = CertRef::new(TLVElement::new(rcac_tlv))
-        .get_fabric_id()
-        .map_err(|e| sdk_err("rcac_tlv does not parse as a Matter TLV certificate", e))?;
-    if rcac_fabric_id != fabric_id {
-        return Err(StackError::new(
-            StackErrorKind::Sdk,
-            format!("the preserved RCAC carries fabric id {rcac_fabric_id}, not the requested {fabric_id}"),
-        ));
+    //
+    // A real matter.js RCAC parses fine but carries NO FabricId in its
+    // subject DN at all (verified in matter.js v0.17.9's
+    // CertificateAuthority.ts: RCAC `subject: { rcacId }` only). That is a
+    // different failure than "not a cert", so `get_fabric_id()` erroring is
+    // disambiguated against `get_ca_id()` on the same cert before either is
+    // reported as a parse failure.
+    let cert_ref = CertRef::new(TLVElement::new(rcac_tlv));
+    match cert_ref.get_fabric_id() {
+        Ok(rcac_fabric_id) if rcac_fabric_id == fabric_id => {}
+        Ok(rcac_fabric_id) => {
+            return Err(StackError::new(
+                StackErrorKind::Sdk,
+                format!("the preserved RCAC carries fabric id {rcac_fabric_id}, not the requested {fabric_id}"),
+            ));
+        }
+        Err(e) => {
+            if cert_ref.get_ca_id().is_ok() {
+                return Err(StackError::new(
+                    StackErrorKind::Sdk,
+                    "the preserved RCAC carries no FabricId in its subject DN — the normal \
+                     matter.js shape. rs-matter's NocGenerator cannot yet mint a controller NOC \
+                     whose issuer DN mirrors such a root (devices validate the NOC's issuer DN \
+                     against the root's subject DN, so a mismatched mint would be rejected at \
+                     CASE). Migration of this store is blocked on an rs-matter change; see the \
+                     spec's Risks section."
+                        .to_string(),
+                ));
+            }
+            return Err(sdk_err("rcac_tlv does not parse as a Matter TLV certificate", e));
+        }
     }
 
     let ca_key = CanonPkcSecretKey::try_from(ca_private_key)
@@ -283,6 +306,57 @@ mod tests {
         let (ca_key, rcac) = generate_ca(1).unwrap();
         let err = identity_from_preserved_ca(&ca_key, &rcac, 42, 0xFFF1, 112233, &EPOCH_KEY).unwrap_err();
         assert!(err.message.contains("fabric id"), "unhelpful error: {}", err.message);
+    }
+
+    /// The real matter.js shape: an RCAC whose subject DN carries a RootCaId
+    /// but no FabricId at all. `get_fabric_id()` errors on this (there is
+    /// nothing to find), but the cert otherwise parses fine — `get_ca_id()`
+    /// finds its RootCaId. The tool must tell these apart: this is NOT the
+    /// same failure as a DER blob or garbage bytes in `rootCertBytes`.
+    ///
+    /// Hand-built minimal TLV (see `rs-matter`'s `cert.rs`: `CertRef::subject`
+    /// reads context tag 6 of the outer struct as a `List` of DN entries;
+    /// each DN entry is itself a context-tagged uint, tag = `DNTag` ordinal —
+    /// `RootCaId` = 20, `FabricId` = 21):
+    ///
+    /// ```text
+    /// 0x15                 outer struct, anonymous
+    ///   0x37 0x06            context tag 6 (Subject), List
+    ///     0x24 0x14 0x01       context tag 20 (RootCaId), U8 value = 1
+    ///   0x18                 end of list
+    /// 0x18                 end of struct
+    /// ```
+    ///
+    /// No FabricId (tag 21) DN entry is present, and no other cert field
+    /// (serial, issuer, signature, ...) is needed — neither `get_fabric_id`
+    /// nor `get_ca_id` reads past the subject list.
+    fn rcac_with_ca_id_but_no_fabric_id() -> Vec<u8> {
+        vec![0x15, 0x37, 0x06, 0x24, 0x14, 0x01, 0x18, 0x18]
+    }
+
+    #[test]
+    fn a_fabricid_less_matterjs_rcac_gets_a_precise_diagnosis_not_a_parse_error() {
+        let (ca_key, _) = generate_ca(1).unwrap();
+        let rcac = rcac_with_ca_id_but_no_fabric_id();
+
+        // Sanity: the cert really does parse (get_ca_id succeeds) but really
+        // does lack a FabricId (get_fabric_id fails) — otherwise this test
+        // would not be exercising the branch it claims to.
+        let cert_ref = CertRef::new(TLVElement::new(&rcac));
+        assert!(cert_ref.get_ca_id().is_ok(), "test fixture must parse as a cert");
+        assert!(cert_ref.get_fabric_id().is_err(), "test fixture must lack a FabricId");
+
+        let err = identity_from_preserved_ca(&ca_key, &rcac, 1, 0xFFF1, 112233, &EPOCH_KEY).unwrap_err();
+        assert!(
+            err.message.contains("no FabricId in its subject DN"),
+            "unhelpful error: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("does not parse"),
+            "a fabricId-less-but-parseable RCAC must not be reported as unparseable: {}",
+            err.message
+        );
     }
 
     #[test]

@@ -115,8 +115,6 @@ pub enum MigrateError {
     Convert(#[from] crate::convert::ConvertError),
     #[error("{0}")]
     Stack(String), // StackError flattened: "<kind>: <message>"
-    #[error("self-checks failed; nothing was written")]
-    ChecksFailed,
     #[error("--from and --to are the same directory")]
     SamePath,
     #[error("writing {path}: {source}")]

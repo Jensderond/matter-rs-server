@@ -109,7 +109,10 @@ impl JsDb {
             })?;
             let name = entry.file_name().to_string_lossy().into_owned();
             all_names.push(name.clone());
-            if name.starts_with("server-") {
+            // A stray file (e.g. a `.bak` leftover) named `server-*` is not a
+            // namespace: only a directory can hold a WAL KV store.
+            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            if name.starts_with("server-") && is_dir {
                 namespaces.push(name);
             }
         }
@@ -632,6 +635,10 @@ mod tests {
         std::fs::create_dir_all(root.path().join("client")).unwrap();
         std::fs::create_dir_all(root.path().join("certificates")).unwrap();
         std::fs::write(root.path().join("chip_config.ini"), b"").unwrap();
+        // Stray FILES named `server-*` must not count as namespaces — only a
+        // directory can hold a WAL KV store.
+        std::fs::write(root.path().join("server-9-dead.bak"), b"").unwrap();
+        std::fs::write(root.path().join("server-2-beef"), b"").unwrap();
 
         let (db, name) = JsDb::open_store(root.path()).unwrap();
         assert_eq!(name, "server-1-fff1");
