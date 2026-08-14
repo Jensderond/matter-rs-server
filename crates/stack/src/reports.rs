@@ -40,7 +40,7 @@ use rs_matter::tlv::TLVElement;
 use serde_json::Value;
 
 use crate::ctx::StackCtx;
-use crate::tlv_json::{self, MATTER_EPOCH_OFFSET_US};
+use crate::tlv_json;
 
 /// Collects attribute reports from one or more `ReportData` chunks into ordered
 /// `("endpoint/cluster/attribute", JSON)` pairs.
@@ -340,27 +340,33 @@ fn node_event(data: &EventData<'_>) -> NodeEventData {
 /// `(unix millis, type)` where type is Node's encoding: 1 = epoch, 0 = system
 /// uptime, 2 = "we substituted our own clock".
 ///
-/// NOTE: the epoch variant is treated as `epoch-us` (microseconds since the
-/// Matter epoch, 2000-01-01) because that is how matter.js — and therefore the
-/// Node server whose output this has to match — reads `EventDataIB` tag 3.
-/// rs-matter's own doc comment on `EventDataTimestamp::EpochTimestamp`
-/// (`rs-matter-ref/rs-matter/src/im/encoding/event.rs:349`) instead calls it
-/// "Posix milliseconds"; rs-matter only passes the raw `u64` through, so the two
-/// readings differ by a factor of 1000 plus the 30-year epoch offset. Task 19's
-/// device run is what settles it.
+/// `EventDataIB` tag 3 carries **Posix milliseconds since 1970**, not the
+/// `epoch-us` (Matter-epoch microseconds) the plan assumed — settled on the
+/// Task 19 device run and not guessable from rs-matter, which passes the raw
+/// `u64` through without an opinion. Two independent confirmations:
+///
+/// 1. matter.js types the field `TlvPosixMs` (a bare `TlvUInt64`) in
+///    `@matter/types/.../protocol/types/TlvEventData.js`, distinct from the
+///    `TlvEpochUs` it has and does not use here, and writes its occurrence
+///    store's `epochTimestamp` — Unix ms — into it unconverted.
+/// 2. Wall clock: a `BasicInformation.shutDown` from the virtual device at Unix
+///    ms 1786698644089 arrived carrying 1786698644xxx. Under the `epoch-us`
+///    reading that same event was reported as 948471498644, i.e. January 2000.
+///
+/// So this now matches both rs-matter's own doc comment
+/// (`rs-matter-ref/rs-matter/src/im/encoding/event.rs:349`) and CHIP, which
+/// stamps `Timestamp::Epoch` in milliseconds too. `MATTER_EPOCH_OFFSET_US` still
+/// applies to `epoch-us` *attribute* fields (`tlv_json`) — that is a different
+/// spec type, and only the event timestamp was misread.
 ///
 /// Delta-encoded timestamps are relative to the previous event on the same
 /// subscription, which we do not retain across chunks, so they fall back to the
 /// local clock and say so via type 2.
 fn convert_timestamp(ts: &EventDataTimestamp) -> (i64, u8) {
     match ts {
-        EventDataTimestamp::EpochTimestamp(us) => {
-            // The divide keeps this far below `i64::MAX` for every input, so both
-            // guards are unreachable — kept because a panicking `+` or `as` here
-            // would be a network-triggerable abort if the arithmetic ever changes.
-            let unix_ms = (us / 1000).saturating_add(MATTER_EPOCH_OFFSET_US / 1000);
-            (i64::try_from(unix_ms).unwrap_or(i64::MAX), 1)
-        }
+        // Same raw-`u64` forwarding as the system branch below, so the `i64`
+        // clamp is equally reachable and must not go negative.
+        EventDataTimestamp::EpochTimestamp(ms) => (i64::try_from(*ms).unwrap_or(i64::MAX), 1),
         EventDataTimestamp::SystemTimestamp(ms) => (i64::try_from(*ms).unwrap_or(i64::MAX), 0),
         EventDataTimestamp::DeltaEpochTimestamp(_)
         | EventDataTimestamp::DeltaSystemTimestamp(_) => (unix_millis(SystemTime::now()), 2),
@@ -622,22 +628,25 @@ mod tests {
         assert!(acc.into_pairs().is_empty());
     }
 
+    /// The exact frame the Task 19 device run produced: a `shutDown` stamped at
+    /// Unix ms 1786698644089 must come out as that same instant, not as the
+    /// January-2000 value the `epoch-us` reading gave (948471498644).
     #[test]
-    fn epoch_timestamp_becomes_unix_millis() {
-        // 2024-01-01T00:00:00Z = 1_704_067_200_000 unix ms
-        //                      =   757_382_400_000_000 us since the Matter epoch
-        let (ms, ty) = convert_timestamp(&EventDataTimestamp::EpochTimestamp(757_382_400_000_000));
-        assert_eq!((ms, ty), (1_704_067_200_000, 1));
+    fn epoch_timestamp_is_posix_millis_not_matter_epoch_micros() {
+        let (ms, ty) = convert_timestamp(&EventDataTimestamp::EpochTimestamp(1_786_698_644_089));
+        assert_eq!((ms, ty), (1_786_698_644_089, 1));
+        // 2024-01-01T00:00:00Z, for a second point that is easy to read.
+        let (ms, _) = convert_timestamp(&EventDataTimestamp::EpochTimestamp(1_704_067_200_000));
+        assert_eq!(ms, 1_704_067_200_000);
     }
 
-    /// The epoch branch's overflow guards are unreachable — dividing by 1000
-    /// brings even `u64::MAX` three orders of magnitude below `i64::MAX` — so
-    /// this pins the arithmetic rather than a saturation that cannot happen.
+    /// Forwarding the raw `u64` makes the `i64` clamp reachable, exactly as on the
+    /// system branch: a device claiming a huge epoch must not yield a negative
+    /// timestamp.
     #[test]
-    fn largest_epoch_timestamp_stays_positive_and_exact() {
+    fn epoch_timestamp_beyond_i64_saturates() {
         let (ms, ty) = convert_timestamp(&EventDataTimestamp::EpochTimestamp(u64::MAX));
-        let expected = i64::try_from(u64::MAX / 1000 + MATTER_EPOCH_OFFSET_US / 1000).unwrap();
-        assert_eq!((ms, ty), (expected, 1));
+        assert_eq!((ms, ty), (i64::MAX, 1));
     }
 
     #[test]
