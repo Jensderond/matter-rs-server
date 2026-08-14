@@ -1,3 +1,4 @@
 matterjs-server
 rs-matter-ref
 target/
+.claude/worktrees/
