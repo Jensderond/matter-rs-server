@@ -6,9 +6,11 @@ subagent-driven development on branch `plan2-rs-matter-core`.
 review and a quality review, plus fix rounds where needed — all closed); Task 17
 was implemented and reviewed by the controller directly rather than by subagents
 (see "Task 17 as executed" below); Tasks 18–19 went back to the review pass.
-**Resume at Task 20** (whole-branch review). Task 19 was the plan's acceptance
-gate and it passed against the virtual matter.js device — see "Task 19 as
-executed", which is the section Task 20 wants.
+Task 19 was the plan's acceptance gate and it passed against the virtual matter.js
+device — see "Task 19 as executed". **Task 20 (whole-branch review) has now RUN,
+its verdict was "ready to merge with fixes", and its one fix wave is applied** —
+see "Task 20: whole-branch review and its fix wave" below. A scoped re-review of
+that wave is the remaining step.
 
 Moved machines twice at Jens's direction: tasks 1–11 on the first, 12–16 on
 CT 110, and now again because rs-matter rebuilds were too slow there. The SDD
@@ -100,6 +102,51 @@ Smaller things done along the way, all in `crates/server`: the `TcpListener` bin
 failure and the `SIGTERM` handler install no longer `unwrap`/`panic`, and a bind
 failure stops the already-running stack thread before exiting.
 
+## Task 20: whole-branch review and its fix wave
+
+The whole-branch review ran at `5a6923b` and found what the per-task reviews
+structurally could not: the *interaction* between decisions made in different
+tasks. **Verdict: ready to merge with fixes. No Critical findings.** Its triage
+list lives in the (ephemeral) SDD ledger; everything it ruled in is applied in one
+fix wave, `9726cc9` / `d75a380` / `e84dea3` plus this docs commit:
+
+- **`config.json` read-modify-write was unserialized and all writers shared one
+  temp path** — the one genuine concurrency bug on the branch, and the reason
+  Task 3's carry-forward check ("confirm `MatterController`'s mutex serializes ALL
+  config write paths") is now answered *no*. Two connections is the normal case, so
+  a lost update dropped a credential from disk *and* memory, and two writers into
+  `.config.json.tmp-<pid>` could leave invalid JSON that `load_config` silently
+  answers with `ConfigData::default()`. Fixed with a dedicated `config_write` tokio
+  mutex spanning the clone-mutate-save-writeback (the std `Mutex<ConfigData>` stays
+  for cheap reads, never held across an await) and a process-wide counter in the
+  temp name. Three regression tests, each verified to fail against the pre-fix code.
+- **Client-supplied numbers were narrowed with `as`** instead of validated — the
+  only class where a malformed request *succeeded against a different target*. See
+  the corrected carryover entry below.
+- **`InvalidArguments` was flattened to `NodeCommissionFailed`** in the
+  commissioning family only; the stack's classification now survives (8 / 4, with 1
+  as the default). The Node server's own code for a malformed pairing code is
+  UNVERIFIED — `matterjs-server` is not cloned on this machine — and a comment at
+  the call site says so, so a future reader with the Node source checks rather than
+  "fixes" it blind.
+- Hygiene: poison-tolerant `std::sync::Mutex` access everywhere in `controller`
+  (a panic in a `Registry` closure used to poison `Registry::inner`, after which
+  *every* command panics forever), `split_ip_port`/`ip_of` consolidated into
+  `controller::addr` (two copies had cost two bugs fixed twice each), credential
+  commands surfacing persistence failures, temp-file cleanup on a failed write,
+  `ping_node`'s `attempts` clamped to 10, a `CLUSTERS` sortedness test, the two
+  `{e:?}` slips in `identity.rs`, the redacting `Debug`, `version` on
+  `ServerIdentity`, and the `fabric_id` warn.
+
+Deliberately NOT done, on Jens's ruling: the `NotFound` (0x8b) carve-out (his
+call, see the corrected limitation entry), any `interview`/`PrimingSnapshot`
+attribute reordering (JSON key order is not semantic), a `cargo fmt` sweep, and the
+~12 `serde_json::to_value(..).unwrap()` sites on types that provably serialize.
+
+`cargo test --workspace` at the end of the wave: **269 passing, 0 failed,
+1 ignored** (256 before it, plus 13 new tests). `cargo clippy --workspace
+--all-targets` is back to exactly the known pre-existing set.
+
 ## Environment prerequisites
 
 - **`rs-matter-ref/`** at the repo root: a clone at pinned rev
@@ -136,6 +183,14 @@ failure stops the already-running stack thread before exiting.
 4. **(Task 19, still open) `NotFound → NodeNotResolving` carve-out.** Task 19's live
    run never produced an IM `NotFound` (0x8b) on a `DefaultSuccess` command, so
    there is **no new evidence** either way and the question below stands unchanged.
+   Task 20's whole-branch review established that it **is** fixable (see the
+   limitation entry below, corrected); the ~10-line carve-out is deliberately left
+   to Jens because it changes which wire code a device-reported status produces,
+   which is a spec-level behaviour decision, not a bug fix.
+5. **(Task 20) `ServerIdentity`'s `Vec<u8>` key copies still do not zeroize on
+   drop** unlike rs-matter's `CryptoSensitive`, and `to_writer_pretty` leaves
+   base64 key strings in freed heap. The third item of that trio — the derived
+   `Debug` — is fixed (`e84dea3`). These two are unchanged and still deferred.
 
 ## Task 17 MUST HANDLE (from Task 16's reviews)
 
@@ -286,13 +341,24 @@ and its doc comment says why to keep it until then.
   not resolve node via mDNS".** rs-matter's `InvokeRespChunk::receive`
   (`im/client.rs:945-961`) converts a bare non-success `StatusResponse` via
   `to_error_code()` before our code sees a chunk, so 0x8b → `ErrorCode::NotFound`
-  → `NodeUnreachable` → wire `NodeNotResolving`. Unfixable in `ops/interact.rs`; a
-  consequence of the plan's own `NotFound → NodeUnreachable` rule. Decide whether
-  the rule needs a carve-out. **STILL OPEN after Task 19** — the live run never
-  produced a 0x8b on a `DefaultSuccess` command (the matter.js OnOffLight answers
-  `toggle` normally and there was no way to provoke one), so there is no new
-  evidence. Documented in the README's limitations list as a known wrong-looking
-  message. A device that rejects a command this way would settle it.
+  → `NodeUnreachable` → wire `NodeNotResolving`. **STILL OPEN after Task 19** —
+  the live run never produced a 0x8b on a `DefaultSuccess` command (the matter.js
+  OnOffLight answers `toggle` normally and there was no way to provoke one), so
+  there is no new evidence. Documented in the README's limitations list as a known
+  wrong-looking message. A device that rejects a command this way would settle it.
+
+  **CORRECTION (Task 20's whole-branch review): this is NOT "unfixable in
+  `ops/interact.rs`", as these notes said until now.** It is fixable there, by
+  splitting the `NotFound` mapping *by phase*: on that path `ErrorCode::NotFound`
+  can only originate in the mDNS resolve inside `Transport::initiate`, so once
+  `Exchange::initiate` has returned `Ok`, a `NotFound` is a device-reported IM
+  status and cannot be a resolve failure. A ~10-line carve-out — map `NotFound`
+  to `NodeUnreachable` only while establishing the exchange, and to
+  `Sdk`/`SdkStackError` afterwards — would do it. It is deliberately **deferred to
+  Jens**, because changing which wire code a device-reported status produces is a
+  spec-level behaviour decision, not a fix to apply on a reviewer's authority.
+  This sentence exists so that a future reader does not skip the investigation on
+  the strength of the word "unfixable".
 - **Cross-`ReportData`-message list merging is not implemented.** Within one
   message, chunked lists merge correctly; a long `PartsList` in a *subscription*
   report split across messages is reported incomplete, with a runtime warning.
@@ -331,21 +397,32 @@ exclusions and gaps, NOT the plan's seven).
 ## Task 18 carryover list (current)
 
 - Silence the `Rig.dir` / `stack_tx` dead-code warnings in the controller test rig.
-- **Secret hygiene in `crates/controller/src/storage.rs`** — all three verified NOT
-  reachable today, hence deferred: `ServerIdentity` derives `Debug` while holding
-  `ca_private_key`/`controller_private_key`/`ipk` as raw `Vec<u8>` (any future
-  `{:?}` dumps the fabric trust anchor into a log; wants a redacting `Debug`);
-  those `Vec<u8>` copies do not zeroize on drop unlike rs-matter's
+- **Secret hygiene in `crates/controller/src/storage.rs`** — the trio was verified
+  NOT reachable today, hence deferred. **The `Debug` half is now DONE** (`e84dea3`:
+  hand-written redacting `Debug`, so no future `{:?}` on `ServerIdentity` or on the
+  `pub` `ReadyInfo` that holds it can print the CA key). Still open and still
+  deferred: those `Vec<u8>` copies do not zeroize on drop unlike rs-matter's
   `CryptoSensitive`; `to_writer_pretty` leaves base64 key strings in freed heap.
-- `crates/controller/src/commands/interaction.rs:78` does `.map(|v| v as u16)` on
+- ~~`crates/controller/src/commands/interaction.rs:78` does `.map(|v| v as u16)` on
   the timed-invoke timeout, so a client sending 65536 lands as `Some(0)` — a
-  request already expired on arrival. Validate the range instead of truncating.
-- `fabric_id` has the same stored-scalar-vs-derived-truth exposure that
-  `compressed_fabric_id` had (the RCAC carries the real one via
-  `CertRef::get_fabric_id()`). Deliberately not auto-corrected: unlike the node id
-  a mismatch is not fatal to CASE, so erroring would refuse to boot a working
-  install, and silently correcting collides with the "stored wins over CLI flags"
-  warn. Needs a decision.
+  request already expired on arrival.~~ **DONE (`9726cc9`), and the description
+  above was stale**: `ops::interact::normalize_timed` filters `Some(0)`, so a
+  truncated 65536 degraded to the 10s default rather than arriving expired. It was
+  still silently not the budget the client asked for, and it is now validated —
+  along with every other client-supplied number that used to be narrowed with `as`
+  (`commands::narrow`). That whole class mattered because a truncating cast made a
+  malformed request succeed *against a different target*: `"70000/6/0"` read and
+  wrote endpoint 4464, and `fabric_index: 256` meant index 0.
+- ~~`fabric_id` has the same stored-scalar-vs-derived-truth exposure that
+  `compressed_fabric_id` had.~~ **RESOLVED (`e84dea3`) — a warn, nothing more.**
+  `install` compares the stored scalar against the RCAC's `get_fabric_id()` and
+  warns only: the certificates are the operative truth (`NocGenerator::create`
+  takes the fabric id from the RCAC, `Fabric::update` reads it back out of the NOC
+  to derive the compressed id), so a mismatch is not fatal to CASE. Erroring would
+  refuse to boot a working install and auto-correcting would contradict "a stored
+  identity always wins over the CLI flags" — the two horns of the old dilemma.
+  Warn-and-boot is asserted by
+  `a_stored_fabric_id_that_disagrees_with_the_rcac_warns_but_still_boots`.
 - Pre-existing clippy: `manual_is_multiple_of` (`storage.rs:221`),
   `type_complexity` (`stack_api.rs:169`), 5 warnings in `gen`'s build script.
 - The repo is not `cargo fmt`-clean by convention (hand-formatted ~100 cols across

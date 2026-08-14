@@ -72,14 +72,18 @@ empty ICAC, rather than the RCAC → ICAC → NOC chain rs-matter defaults to. T
 spec-legal and explicitly supported upstream (`NocGenerator`'s "RCAC-direct
 mode"), and it keeps the stored identity smaller.
 
-It is not a preference: with an ICAC, matter.js rejects `AddNOC` outright (spike
-finding 1). The underlying cause turned out to be rs-matter emitting a
-certificate's random serial number verbatim as a DER INTEGER, so half of all
-generated RCACs and ICACs are *negative* integers that any peer re-encoding the
-TLV to DER — matter.js does — hashes differently and rejects with "Signature
-verification failed". Dropping the ICAC halves the exposure; the server also
-redraws the RCAC until its serial is DER-canonical, which removes it. See the
-amendment on spike finding 1 and `crates/stack/src/identity.rs`.
+Spike finding 1 recorded this as "with an ICAC, matter.js rejects `AddNOC`
+outright", and that framing was wrong twice over. The real cause is rs-matter
+emitting a certificate's random serial number verbatim as a DER INTEGER: half of
+all generated certificates get a *negative* serial, which any peer that
+re-encodes the TLV to DER — matter.js does — hashes differently and rejects with
+"Signature verification failed". `RcacGenerator` and `IcacGenerator` have the
+**same** bug, so an ICAC chain is not impossible, it would just need the same
+redraw applied to the ICAC as well. The server redraws the RCAC until its serial
+is DER-canonical, which removes the exposure for RCAC-direct; dropping the ICAC
+means there is only one certificate to redraw. That is the v1 simplification —
+one fewer thing to get right, not a closed door. See the amendment on spike
+finding 1 and `crates/stack/src/identity.rs`.
 
 The redraw only protects fabrics minted after it existed. A `server.json` written
 earlier has a 50% chance of holding a non-canonical RCAC, and it is never reminted
