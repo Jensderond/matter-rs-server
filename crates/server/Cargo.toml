@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 matter-rs-wire = { path = "../wire" }
 matter-rs-controller = { path = "../controller" }
+matter-rs-stack = { path = "../stack" }
 tokio.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 clap = { version = "4", features = ["derive", "env"] }
@@ -26,3 +27,4 @@ futures-util = "0.3"
 [dev-dependencies]
 tokio-tungstenite = "0.24"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tempfile = "3"
