@@ -8,7 +8,6 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use matter_rs_controller::storage::Storage;
-use matter_rs_migrate::convert::FabricIndexSource;
 use matter_rs_migrate::{run, Options};
 use matter_rs_stack::migration::{
     derive_operational_ipk, generate_ca, identity_from_preserved_ca, rcac_public_key,
@@ -35,7 +34,6 @@ fn map_tag(entries: Vec<(Value, Value)>) -> Value {
 }
 
 struct Fixture {
-    store_root: PathBuf,
     ca_private_key: Vec<u8>,
     rcac_tlv: Vec<u8>,
     compressed_fabric_id: u64,
@@ -98,7 +96,6 @@ fn build_fixture(root: &Path) -> Fixture {
     let minted =
         identity_from_preserved_ca(&ca_private_key, &rcac_tlv, 1, 0xFFF1, 112233, &EPOCH_KEY).unwrap();
     let f = Fixture {
-        store_root: root.to_path_buf(),
         root_public_key: rcac_public_key(&rcac_tlv).unwrap(),
         compressed_fabric_id: minted.compressed_fabric_id,
         ca_private_key,
