@@ -349,9 +349,11 @@ fn node_event(data: &EventData<'_>) -> NodeEventData {
 ///    `@matter/types/.../protocol/types/TlvEventData.js`, distinct from the
 ///    `TlvEpochUs` it has and does not use here, and writes its occurrence
 ///    store's `epochTimestamp` — Unix ms — into it unconverted.
-/// 2. Wall clock: a `BasicInformation.shutDown` from the virtual device at Unix
-///    ms 1786698644089 arrived carrying 1786698644xxx. Under the `epoch-us`
-///    reading that same event was reported as 948471498644, i.e. January 2000.
+/// 2. Wall clock: the virtual device logged a `BasicInformation.shutDown` with
+///    `epochTimestamp: 1786698881562` (2026-08-14T09:14:41.562Z, the moment it was
+///    interrupted) and this function now reports exactly 1786698881562. Under the
+///    `epoch-us` reading the same value came out as 948471498881 — January 2000,
+///    26 years off, which is what an earlier run reported to the client.
 ///
 /// So this now matches both rs-matter's own doc comment
 /// (`rs-matter-ref/rs-matter/src/im/encoding/event.rs:349`) and CHIP, which
@@ -628,13 +630,14 @@ mod tests {
         assert!(acc.into_pairs().is_empty());
     }
 
-    /// The exact frame the Task 19 device run produced: a `shutDown` stamped at
-    /// Unix ms 1786698644089 must come out as that same instant, not as the
-    /// January-2000 value the `epoch-us` reading gave (948471498644).
+    /// The exact value the Task 19 device run produced: the virtual device's
+    /// `shutDown` carried `epochTimestamp: 1786698881562` and must come out as
+    /// that same instant, not as the January-2000 value the `epoch-us` reading
+    /// would give it (948471498881).
     #[test]
     fn epoch_timestamp_is_posix_millis_not_matter_epoch_micros() {
-        let (ms, ty) = convert_timestamp(&EventDataTimestamp::EpochTimestamp(1_786_698_644_089));
-        assert_eq!((ms, ty), (1_786_698_644_089, 1));
+        let (ms, ty) = convert_timestamp(&EventDataTimestamp::EpochTimestamp(1_786_698_881_562));
+        assert_eq!((ms, ty), (1_786_698_881_562, 1));
         // 2024-01-01T00:00:00Z, for a second point that is easy to read.
         let (ms, _) = convert_timestamp(&EventDataTimestamp::EpochTimestamp(1_704_067_200_000));
         assert_eq!(ms, 1_704_067_200_000);

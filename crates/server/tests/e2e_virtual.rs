@@ -39,7 +39,8 @@ const COMMISSION_CAP: Duration = Duration::from_secs(120);
 /// are fast; a second-scale cap is only here to keep a hang from hanging the run.
 const REPLY_CAP: Duration = Duration::from_secs(30);
 
-type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[tokio::test]
 #[ignore = "needs npx + a LAN interface; set MRS_E2E=1 and see scripts/e2e-virtual-device.md"]
@@ -63,7 +64,8 @@ async fn commissions_controls_and_reports_a_virtual_matter_js_device() {
     let (mut server, addr) = start_server(server_dir.path(), &iface).await;
 
     let mut ws = connect(&addr).await;
-    let info = next_json(&mut ws, "the server_info greeting", tokio::time::Instant::now() + REPLY_CAP).await;
+    let greeting_by = tokio::time::Instant::now() + REPLY_CAP;
+    let info = next_json(&mut ws, "the server_info greeting", greeting_by).await;
     assert_eq!(info["schema_version"], 13, "server_info was {info}");
 
     // Before commissioning: every event below is dropped for a connection that

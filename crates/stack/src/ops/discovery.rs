@@ -95,7 +95,8 @@ pub(crate) async fn browse_one<C: Crypto>(
     budget: Duration,
 ) -> Result<(Address, u64), StackError> {
     let ms = u32::try_from(budget.as_millis()).unwrap_or(u32::MAX);
-    let fut = pin!(ctx.matter.transport().browse_commissionable(filter, exclude, inner_budget_ms(ms)));
+    let inner = inner_budget_ms(ms);
+    let fut = pin!(ctx.matter.transport().browse_commissionable(filter, exclude, inner));
     let timer = pin!(Timer::after(budget));
 
     match select(fut, timer).await {

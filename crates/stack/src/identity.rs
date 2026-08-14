@@ -36,8 +36,8 @@ pub(crate) const FABRIC_LABEL_MAX_BYTES: usize = 32;
 
 /// How many RCACs to draw before giving up on finding one a strict peer will
 /// accept. See [`serial_is_der_canonical`] for why a draw can be unusable;
-/// `RcacGenerator` picks the serial number from 8 random bytes, so a bit over
-/// half of all draws are fine and 16 attempts leaves a ~1-in-65000 residual.
+/// `RcacGenerator` picks the serial number from 8 random bytes, so just under
+/// half of all draws are usable and 16 attempts leaves a ~1-in-65000 residual.
 /// Each attempt costs one P-256 keygen plus one signature, and this runs exactly
 /// once in the lifetime of an installation.
 const RCAC_DRAW_ATTEMPTS: usize = 16;
