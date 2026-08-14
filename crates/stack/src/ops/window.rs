@@ -65,9 +65,6 @@ const INVALID_PASSCODES: &[u32] = &[
     12345678, 87654321,
 ];
 
-// TODO(task16): remove the allow — `StackHandle::open_commissioning_window` is
-// the caller.
-#[allow(dead_code)]
 pub(crate) async fn open_window<C: Crypto>(
     ctx: &StackCtx<C>,
     node_id: u64,

@@ -147,10 +147,6 @@ async fn read_attributes_inner<C: Crypto>(
     .await
 }
 
-// TODO(task16): remove the allow — `interview` and `write_attribute` are
-// reached only through `StackHandle`; every other operation here already has an
-// in-crate caller.
-#[allow(dead_code)]
 pub(crate) async fn interview<C: Crypto>(
     ctx: &StackCtx<C>,
     node_id: u64,
@@ -163,7 +159,6 @@ pub(crate) async fn interview<C: Crypto>(
         .map(|v| v.into_iter().collect())
 }
 
-#[allow(dead_code)] // TODO(task16): see `interview` above.
 pub(crate) async fn write_attribute<C: Crypto>(
     ctx: &StackCtx<C>,
     node_id: u64,

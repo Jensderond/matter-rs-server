@@ -27,9 +27,6 @@ use crate::ops::addr_to_string;
 /// with `ResourceExhausted` instead of browsing.
 const MAX_SWEEP: usize = 6;
 
-// TODO(task16): remove the allow — `StackHandle::browse_commissionable` is the
-// caller.
-#[allow(dead_code)]
 pub(crate) async fn browse<C: Crypto>(
     ctx: &StackCtx<C>,
     timeout_ms: u32,

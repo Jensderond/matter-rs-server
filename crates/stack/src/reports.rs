@@ -2,8 +2,8 @@
 //! via [`AttrAccumulator`]) and the unsolicited kind (post-priming subscription
 //! reports, via [`ReportSink`]).
 //!
-//! `ReportSink` is registered via `InteractionModel::new_with_reports`
-//! (Task 16). Reports for `(node, subscription id)` pairs we do not track are
+//! `ReportSink` is registered via `InteractionModel::new_with_reports` by
+//! `crate::runtime::run_stack`. Reports for `(node, subscription id)` pairs we do not track are
 //! answered `InvalidSubscription`, which is what makes a device tear down a
 //! subscription left over from before a controller restart — intended, not a
 //! failure path.
@@ -226,15 +226,11 @@ fn list_index(path: &AttrPath) -> Option<u16> {
     path.list_index.as_ref().and_then(|n| n.as_opt_ref()).copied()
 }
 
-// TODO(task16): remove both allows — the handler is registered via
-// `InteractionModel::new_with_reports` by the runtime thread, which is the only
-// thing that ever constructs it. Until then nothing reaches `handle_report`, and
-// the allow on the impl is what keeps its private helpers (`node_event`,
-// `event_json`, `convert_timestamp`) from being reported dead in turn.
-#[allow(dead_code)]
+/// The `ReportDataHandler` the runtime registers via
+/// `InteractionModel::new_with_reports`: every inbound subscription report lands
+/// here and is forwarded to the controller as a `StackEvent`.
 pub(crate) struct ReportSink<C: Crypto>(pub Rc<StackCtx<C>>);
 
-#[allow(dead_code)]
 impl<C: Crypto> ReportDataHandler for ReportSink<C> {
     async fn handle_report(
         &self,

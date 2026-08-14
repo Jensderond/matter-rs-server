@@ -30,9 +30,6 @@ mod tag {
     pub const FABRIC_INDEX: &str = "254";
 }
 
-// TODO(task16): remove the allows on the three entry points below — all of them
-// are reached only through `StackHandle`.
-#[allow(dead_code)]
 pub(crate) async fn device_fabrics<C: Crypto>(
     ctx: &StackCtx<C>,
     node_id: u64,
@@ -94,7 +91,6 @@ fn parse_fabrics(pairs: &[(String, Value)]) -> Result<Vec<DeviceFabric>, StackEr
     Ok(out)
 }
 
-#[allow(dead_code)]
 pub(crate) async fn remove_device_fabric<C: Crypto>(
     ctx: &StackCtx<C>,
     node_id: u64,
@@ -135,7 +131,6 @@ fn check_noc_response(command: &str, resp: &Value) -> Result<(), StackError> {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) async fn update_fabric_label<C: Crypto>(
     ctx: &StackCtx<C>,
     label: &str,

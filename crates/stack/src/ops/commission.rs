@@ -38,8 +38,6 @@ const BROWSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// this (`rs-matter-ref/rs-matter/src/pairing/qr.rs:426`).
 const QR_BUF_LEN: usize = 512;
 
-// TODO(task16): remove the allow — `StackHandle::commission` is the caller.
-#[allow(dead_code)]
 pub(crate) async fn commission<C: Crypto>(
     ctx: &StackCtx<C>,
     req: CommissionRequest,

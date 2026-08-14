@@ -22,7 +22,9 @@ base64 = "0.22"
 serde_json.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
-tokio = { version = "1", features = ["sync", "rt"] }
+tokio = { version = "1", features = ["sync", "rt", "time"] }
 
 [dev-dependencies]
 tempfile = "3"
+# `test-util` for `start_paused` (a 5s shutdown cap is not worth waiting out).
+tokio = { version = "1", features = ["macros", "rt", "test-util", "time"] }

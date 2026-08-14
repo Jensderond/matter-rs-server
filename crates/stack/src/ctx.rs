@@ -65,7 +65,7 @@ pub(crate) struct StackCtx<C: Crypto> {
     pub addrs: RefCell<HashMap<u64, Vec<String>>>,
     /// node_id -> supervisor task (dropping cancels).
     ///
-    /// **Cleanup contract for `stop_supervisor` (Task 16).** Dropping the task
+    /// **Cleanup contract for `stop_supervisor`.** Dropping the task
     /// releases the two *subscription-lifetime* maps by itself — the supervisor
     /// holds a guard over `subs` and `liveness` (`supervisor::SubscriptionGuard`),
     /// so cancelling it mid-await cannot leak either. The two *node-lifetime*
@@ -79,9 +79,6 @@ pub(crate) struct StackCtx<C: Crypto> {
 }
 
 impl<C: Crypto> StackCtx<C> {
-    // TODO(task16): remove the allow — the runtime thread is what builds the
-    // context; everything else here already has callers.
-    #[allow(dead_code)]
     pub fn new(
         matter: &'static Matter<'static>,
         crypto: C,
@@ -111,7 +108,7 @@ impl<C: Crypto> StackCtx<C> {
 
     /// Forget the event high-water mark for `node_id`.
     ///
-    /// Task 15's supervisor MUST call this every time it establishes a
+    /// The supervisor MUST call this every time it establishes a
     /// subscription. The dedupe assumes event numbers only ever move forward, but
     /// a device that does not persist its event counter restarts numbering at 0
     /// after a reboot — and from then on every event compares `<=` the pre-reboot

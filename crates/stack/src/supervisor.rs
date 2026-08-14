@@ -8,12 +8,12 @@
 //! They meet at `ctx.subs`, and the handshake around that map is the delicate
 //! part — see [`establish`].
 //!
-//! The task runs until dropped. Task 16 keeps the handle in `ctx.supervisors`, so
-//! dropping it is how `stop_supervisor` cancels the loop — which means
-//! cancellation happens at an arbitrary await, almost always the watchdog's
-//! `Timer`. Everything a live subscription owns in `ctx` therefore has to be
-//! released from a `Drop`, not from the code path after the await:
-//! [`SubscriptionGuard`].
+//! The task runs until dropped. The runtime keeps the handle in
+//! `ctx.supervisors` (`crate::runtime::request_loop`), so dropping it is how
+//! `stop_supervisor` cancels the loop — which means cancellation happens at an
+//! arbitrary await, almost always the watchdog's `Timer`. Everything a live
+//! subscription owns in `ctx` therefore has to be released from a `Drop`, not
+//! from the code path after the await: [`SubscriptionGuard`].
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -55,9 +55,6 @@ const LIVENESS_POLL_SECS: u64 = 5;
 /// mDNS resolve per minute.
 const BACKOFF_SCHEDULE_SECS: [u64; 5] = [2, 5, 10, 30, 60];
 
-// TODO(task16): remove the allow — the runtime thread spawns one of these per
-// commissioned node and parks the handle in `ctx.supervisors`.
-#[allow(dead_code)]
 pub(crate) async fn supervise<C: Crypto>(ctx: Rc<StackCtx<C>>, node_id: u64) {
     let mut backoff_idx = 0usize;
 
@@ -237,8 +234,9 @@ async fn establish<C: Crypto>(
 ///
 /// It covers `subs` and `liveness` — the two maps whose lifetime is the
 /// *subscription's*. `last_event` and `addrs` outlive any single subscription
-/// (they are per-node caches), so clearing them belongs to Task 16's
-/// `stop_supervisor`, alongside removing the `ctx.supervisors` entry.
+/// (they are per-node caches), so clearing them belongs to the `StopSupervisor`
+/// arm of `crate::runtime::request_loop`, which does it in `runtime::forget_node`
+/// alongside removing the `ctx.supervisors` entry.
 struct SubscriptionGuard<'a> {
     subs: &'a RefCell<HashMap<u64, u32>>,
     liveness: &'a RefCell<HashMap<u64, Instant>>,
@@ -294,9 +292,9 @@ fn liveness_expired(
 /// Give up ownership of `sub_id` for `node_id`.
 ///
 /// Compare-then-remove because a blind `remove` would delete an entry that some
-/// other establishment had already replaced. Task 16 keeps one supervisor per
-/// node, so this cannot happen today; it costs one comparison to keep it from
-/// becoming a silent cross-wiring if that ever changes.
+/// other establishment had already replaced. The runtime keeps one supervisor
+/// per node, so this cannot happen today; it costs one comparison to keep it
+/// from becoming a silent cross-wiring if that ever changes.
 ///
 /// Takes the map rather than the whole `StackCtx` so it is testable: a `StackCtx`
 /// needs a `&'static Matter`, and this comparison is the only non-obvious logic in
