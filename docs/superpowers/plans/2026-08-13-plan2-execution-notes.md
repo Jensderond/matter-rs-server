@@ -2,9 +2,11 @@
 
 Plan: `docs/superpowers/plans/2026-08-13-plan2-rs-matter-core.md`, executed via
 subagent-driven development on branch `plan2-rs-matter-core`.
-**Tasks 1–16 are COMPLETE and per-task reviewed** (each with a spec review and a
-quality review, plus fix rounds where needed — all closed). **Resume at Task 17**
-(`server` — wire the real controller, replacing the stub).
+**Tasks 1–17 are COMPLETE.** Tasks 1–16 were per-task reviewed (each with a spec
+review and a quality review, plus fix rounds where needed — all closed); Task 17
+was implemented and reviewed by the controller directly rather than by subagents
+(see "Task 17 as executed" below). **Resume at Task 18** (carryover hygiene
+batch).
 
 Moved machines twice at Jens's direction: tasks 1–11 on the first, 12–16 on
 CT 110, and now again because rs-matter rebuilds were too slow there. The SDD
@@ -31,25 +33,75 @@ handoff.** Everything a resuming controller needs is here plus git history.
 | 14 | generic IM read/write/invoke/interview + report sink | `ae056ad` |
 | 15 | node supervisor, commissioning, OCW, device fabrics, discovery | `e50547a` |
 | 16 | runtime thread, request loop, `StackHandle` | `2674994` |
+| 17 | `server` — real controller wired, stub retired from main | `511a93d` |
 
 `cargo test --workspace` green at every task boundary: 95 → 126 → 136 → 167 →
-209 → 239 tests. At Task 16's commit: **239 passing, 0 failed**, `cargo clippy -p
-matter-rs-stack --all-targets` clean, `cargo check -p matter-rs-stack
---all-targets` clean in 57s.
+209 → 239 → 244 tests. At Task 17's commit: **244 passing, 0 failed**, `cargo
+clippy -p matter-rs-server --all-targets` clean (zero warnings from
+`crates/server`; the rest are the known pre-existing ones on the Task 18 list).
 
-> Task 16's fix round landed in full but its agent's completion record was lost;
-> the code was verified by inspection (all 8 items present) plus a clean
-> `cargo check`. **The one thing not re-run after that fix round is
-> `cargo test --workspace`** — do that first on the new machine. It was 239 green
-> before the fix round, and the round was comment/doc rewrites plus an AtomicBool
-> gate and added tests.
+> Task 16's fix round was verified on this machine after the move: `cargo test
+> --workspace` ran to **239 passing, 0 failed**, closing the one gate the notes
+> flagged as inspection-only. `rs-matter-ref/` was already present at the pinned
+> rev `03bc8f2`, so neither prerequisite needed redoing.
+
+## Task 17 as executed
+
+Process deviation: implemented and reviewed by the controller directly, not via
+the two parallel review subagents tasks 12–16 used (the session's operating
+instructions bar dispatching agents unprompted). The review checklist was still
+worked — it caught one real defect, in the new tests rather than the code: a
+`reload::Handle` holds only a *weak* reference to the filter its `Layer` owns, so
+the first test rig dropped the layer and every `reload` failed with
+`SubscriberGone`. The production path is unaffected (`init` moves the layer into
+the global subscriber, which lives for the process), and `set`'s `if let Err`
+guard correctly declined to report a level change that had not happened. Both
+facts are now pinned by `a_failed_reload_does_not_change_the_reported_level`.
+
+**Tasks 18–20 should go back to the two-review pass** if subagents are available.
+
+How each Task 16 must-handle item was closed:
+
+1. **Dead stack now visible.** The `StackEvent` stream is relayed through `main`
+   (`relay_tx`/`relay_rx`), and its end-of-stream fires a `died_tx` oneshot that
+   sits in `main`'s shutdown `select!`. Verified the signal is real: `ctx` (which
+   owns the events sender) is a thread-local `Rc` declared *before* `im` and the
+   executor, so it drops last as `run_stack` returns — no clone outlives the
+   thread. A dead stack now runs the normal shutdown (so WS clients get their
+   `server_shutdown` frame and HA reconnects) and then `exit(1)`.
+   `node_manager.rs:53` still breaks silently; that is now harmless because the
+   process is going down with it.
+2. **Closed ready channel = failed boot.** All three modes — timeout, `Ok(Err)`
+   from the oneshot, `Err` from the boot — go through `fatal()`: log, plain
+   `fatal:` line on stderr, `exit(1)`, no panic backtrace. Both channels on
+   purpose: `RUST_LOG` can silence our target, and a silent fatal exit is worse
+   than a duplicated line.
+3. **10s shutdown budgeted.** `DRAIN_TIMEOUT` is 3s for the listeners, then
+   `shutdown()`'s own ≤10s, so ~13s worst case — documented on the const, and
+   `smoke.rs`'s `STOP_CAP` is 30s so it cannot be flaky by construction.
+4/5. In-flight-work loss and log-only mDNS degradation are documented at the
+   shutdown call site; they stay Task 19 README limitations.
+
+**Deviation from the plan's Step 2 snippet, deliberate:** the plan passes
+`normalize_fabric_label(config.default_fabric_label.as_deref())` as the boot
+label, which is `"HomeAssistant"` whenever the flag is absent. That would revert
+the fabric label on every boot while `config.json` — written by
+`set_default_fabric_label`, and what `get_fabric_label` and `commission_with_code`
+read — still reported the client's choice. Now: the CLI flag pins and is persisted
+(so the pin beats a stale stored value, as the plan intends), and without the flag
+the **stored** label is the truth.
+
+Smaller things done along the way, all in `crates/server`: the `TcpListener` bind
+failure and the `SIGTERM` handler install no longer `unwrap`/`panic`, and a bind
+failure stops the already-running stack thread before exiting.
 
 ## Environment prerequisites
 
 - **`rs-matter-ref/`** at the repo root: a clone at pinned rev
   `03bc8f2aeb7765a93e7863e2263f73c7bbc3d401`. Gitignored, does NOT travel —
-  recreate it before Tasks 17/19. Every task cites paths into it as ground truth.
+  recreate it before Task 19. Every task cites paths into it as ground truth.
   A symlink into `~/.cargo/git/checkouts/rs-matter-*/03bc8f2` also works.
+  *Present and verified at the pinned rev on the current machine.*
 - **`matterjs-server/`** is NOT needed for tasks 12–20 (grepped; only the Node
   facts already embedded in each task are used). Clone it only if Task 20 wants to
   spot-check exact Node error strings.
