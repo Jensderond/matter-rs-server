@@ -25,13 +25,17 @@ pub fn parse_attribute_path(path: &str) -> Result<AttributePathSpec, CommandErro
             Err(_) => None, // '*' or anything non-numeric
         }
     };
+    // `try_from` + a lazy error rather than `commands::narrow`: this runs on every
+    // segment of every path (the interview reads wildcards in bulk), and `narrow`
+    // would want the message string built up front, three allocations per path.
+    let too_big = |what: &str, n: u64| invalid(format!("{what} in attribute path {path:?} out of range: {n}"));
     Ok(AttributePathSpec {
         endpoint: seg(parts[0], 0xFFFF)
-            .map(|n| narrow(n, &format!("endpoint id in attribute path {path:?}"))).transpose()?,
+            .map(|n| u16::try_from(n).map_err(|_| too_big("endpoint id", n))).transpose()?,
         cluster: seg(parts[1], 0xFFFF_FFFF)
-            .map(|n| narrow(n, &format!("cluster id in attribute path {path:?}"))).transpose()?,
+            .map(|n| u32::try_from(n).map_err(|_| too_big("cluster id", n))).transpose()?,
         attribute: seg(parts[2], 0xFFFF_FFFF)
-            .map(|n| narrow(n, &format!("attribute id in attribute path {path:?}"))).transpose()?,
+            .map(|n| u32::try_from(n).map_err(|_| too_big("attribute id", n))).transpose()?,
     })
 }
 

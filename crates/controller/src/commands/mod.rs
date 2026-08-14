@@ -20,8 +20,8 @@ pub fn invalid(msg: impl Into<String>) -> CommandError { err(ServerErrorCode::In
 ///
 /// This is the one class of malformed request that used to produce a successful
 /// operation on a **different target** rather than an error: `70000 as u16` is
-/// 4464, so `"70000/6/0"` read — or with `write_attribute`/`set_acl_entry`,
-/// wrote — endpoint 4464, and `fabric_index: 256 as u8` is 0. The device side of
+/// 4464, so `"70000/6/0"` read — or through `write_attribute`, wrote — endpoint
+/// 4464, and `fabric_index: 256 as u8` is 0. The device side of
 /// this branch validates every numeric range meticulously (`tlv_json`'s
 /// `write_unsigned`/`write_signed`, `vid_pid_from`); the client side must too.
 ///
