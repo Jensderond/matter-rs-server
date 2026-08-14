@@ -108,6 +108,13 @@ subscription came up. The result is a `MatterNodeData` with `node_id: 1` and 121
 attribute paths; `available` is `false` in it because the supervisor connects
 after commissioning returns.
 
+**Wait for that `available: true` before toggling.** `attribute_updated` is a
+*subscription* report, so a command issued in the window between
+`commission_with_code` returning and the subscription being established changes
+the device but produces no `attribute_updated` — the new value is folded into the
+priming snapshot and arrives as another `node_updated` instead. Reads and commands
+themselves work fine in that window; only the change notification is affected.
+
 ```json
 {"message_id":"3","command":"get_node_ip_addresses","args":{"node_id":1}}
 -> {"message_id":"3","result":["fe80::87f:8d29:2561:f7fb"]}

@@ -21,6 +21,23 @@ End-to-end run (`SPIKE_NO_ICAC=1`): discovery → commission → control in ~3 s
 
 ### Finding 1 (upstream bug): matter.js rejects rs-matter's ICAC
 
+> **Amended 2026-08-14 (plan 2, Task 19) — the diagnosis below was wrong, and so
+> was "OK in RCAC-direct mode".** The real defect is that rs-matter's ASN.1 writer
+> emits a certificate's serial number verbatim as the X.509 `serialNumber` INTEGER
+> (`cert/asn1_writer.rs:183`), while `RcacGenerator`/`IcacGenerator` fill that
+> serial with 8 *random* bytes. Half of those have the top bit set, which is a
+> **negative** DER integer. rs-matter signs its own conversion and so verifies its
+> own certs, but matter.js re-encodes the Matter TLV to DER, inserts the `0x00`
+> sign pad DER requires, hashes a different TBS certificate, and rejects the cert
+> — `Signature verification failed`, which is what the ICAC hit here.
+> RCAC-direct did not fix it; it only halved the number of coin flips, and the
+> spike's RCAC happened to land positive. Task 19's first run failed at
+> `AddTrustedRootCertificate` with the identical error on the **RCAC**.
+> `NocGenerator::encode_serial_asn1` (`onboard/noc.rs:237`) pads correctly, so NOCs
+> were never affected. The server now redraws RCACs until the serial is
+> DER-canonical (`crates/stack/src/identity.rs`). The upstream report should be
+> about the serial encoding, not about ICAC TLV/DER.
+
 With the default RCAC→ICAC→NOC chain, the device rejects `AddNOC` with
 NOCResponse status 3; matter.js log:
 
