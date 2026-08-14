@@ -95,13 +95,14 @@ pub(crate) async fn browse_one<C: Crypto>(
     budget: Duration,
 ) -> Result<(Address, u64), StackError> {
     let ms = u32::try_from(budget.as_millis()).unwrap_or(u32::MAX);
-    let fut = pin!(ctx.matter.transport().browse_commissionable(filter, exclude, ms));
+    let fut = pin!(ctx.matter.transport().browse_commissionable(filter, exclude, inner_budget_ms(ms)));
     let timer = pin!(Timer::after(budget));
 
     match select(fut, timer).await {
         Either::First(r) => r.map_err(map_err),
-        // Only reachable while another browse holds the slot, since the inner
-        // call would otherwise have returned `NotFound` at the same instant.
+        // Reachable only when the slot was contended for at least the margin
+        // `inner_budget_ms` shaves off — see there for why that is what makes this
+        // arm's message true rather than merely plausible.
         Either::Second(()) => Err(StackError::new(
             StackErrorKind::Timeout,
             format!(
@@ -110,6 +111,30 @@ pub(crate) async fn browse_one<C: Crypto>(
             ),
         )),
     }
+}
+
+/// Margin, in ms, by which the inner browse's budget is cut short of the outer
+/// timer's. Large enough that ordinary slot acquisition (a single `Signal` poll)
+/// never eats it, small enough to be invisible in a 30s browse.
+const SLOT_MARGIN_MS: u32 = 100;
+
+/// The budget to hand `browse_commissionable`, given the caller's.
+///
+/// It must be *strictly shorter* than the outer timer's. rs-matter arms the
+/// browse's own timeout only after winning the rendezvous slot
+/// (`rs-matter-ref/rs-matter/src/transport.rs:520-552`), so with equal budgets the
+/// outer timer — already running while the slot is acquired — always fires first,
+/// and every ordinary "nothing is advertising" came back to the client as
+/// `NodeNotResolving` with "another discovery or commissioning was holding the
+/// browse slot". Which is how a first e2e run against a wedged virtual device
+/// reported a contended slot on an otherwise idle stack.
+///
+/// Shaving the margin off makes the inner call win whenever it did get the slot
+/// promptly, so `NotFound` (correctly `NodeUnreachable`) is what a client sees for
+/// an empty network, and the contention message means contention. The floor at
+/// half the budget keeps a deliberately short browse from collapsing to nothing.
+fn inner_budget_ms(ms: u32) -> u32 {
+    ms.saturating_sub(SLOT_MARGIN_MS).max(ms / 2)
 }
 
 /// Log the error that ended a sweep.
@@ -225,6 +250,27 @@ mod tests {
         let s = Sweep::default();
         assert_eq!(s.len(), 0);
         assert!(s.into_devices().is_empty());
+    }
+
+    /// The inner budget must be strictly shorter than the outer timer's, or the
+    /// outer one always wins the race and an empty network is reported as slot
+    /// contention (the Task 19 e2e's first failure mode).
+    #[test]
+    fn the_inner_browse_budget_always_expires_before_the_outer_timer() {
+        for ms in [1u32, 2, 100, 200, 3_000, 30_000, u32::MAX] {
+            let inner = inner_budget_ms(ms);
+            assert!(inner < ms, "inner {inner} must beat outer {ms}");
+        }
+        // …while still leaving most of a normal browse to the browse itself.
+        assert_eq!(inner_budget_ms(30_000), 29_900);
+        assert_eq!(inner_budget_ms(3_000), 2_900);
+        // A deliberately short browse keeps half rather than collapsing to zero.
+        assert_eq!(inner_budget_ms(100), 50);
+        assert_eq!(inner_budget_ms(2), 1);
+        // Degenerate but total: 1ms in, 0ms out — an immediate `NotFound`, which
+        // is the right answer for a budget already gone.
+        assert_eq!(inner_budget_ms(1), 0);
+        assert_eq!(inner_budget_ms(0), 0);
     }
 
     /// The whole point of the budget arithmetic: successive browses share one
