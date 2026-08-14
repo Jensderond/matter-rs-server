@@ -170,10 +170,17 @@ user's other ecosystem from their own device on the first removal, and it would 
 looked like a Home Assistant bug.
 
 The real index is recoverable offline. Each node's cached Operational Credentials
-cluster (`nodes.peer<N>.endpoints.0.62`, attribute `1` = `fabrics`) lists every
+cluster (`nodes.peer<K>.endpoints.0.62`, attribute `1` = `fabrics`) lists every
 fabric on that device as `{rootPublicKey, vendorId, fabricId, nodeId, label,
-fabricIndex}`. The tool finds the entry whose `rootPublicKey` equals the preserved
-root's public key and takes its `fabricIndex`.
+fabricIndex}`. **Corrected during cutover testing (2026-08-14): `<K>` is
+matter.js's peer index, NOT the node id** — on the reference install `peer1`
+holds the device commissioned as node 8 — so a per-node context lookup finds
+nothing. The tool instead scans every `nodes.peer*.endpoints.0.62` cache,
+takes the entries whose `rootPublicKey` equals the preserved root's public
+key, and joins on the `nodeId` field inside the entry (the device's own
+operational node id on our fabric) to get that node's `fabricIndex`. Also
+observed on the real store: the entry's scalar fields are plain JSON numbers,
+not `BigInt`-tagged (the decoder accepts both).
 
 **When it cannot be determined, write `0`, not a guess.** Fabric index 0 is invalid
 in Matter, so the device rejects `RemoveFabric(0)` with a constraint error; the

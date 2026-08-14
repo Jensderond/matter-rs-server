@@ -47,10 +47,14 @@ fn foreign_root_pk(fill: u8) -> Vec<u8> {
     pk
 }
 
-fn fabric_entry(pk: &[u8], index: u64, label: &str) -> Value {
+/// A cached fabric-table entry in the reference store's observed shape:
+/// `rootPublicKey` tagged, the scalars PLAIN numbers. `node_id` is the
+/// device's operational node id on that fabric — the matcher's join key
+/// (peer-cache context names carry matter.js's peer INDEX, not the node id).
+fn fabric_entry(pk: &[u8], node_id: u64, index: u64, label: &str) -> Value {
     json!({
-        "rootPublicKey": bytes(pk), "vendorId": 4996, "fabricId": bigint(1),
-        "nodeId": bigint(112233), "label": label, "fabricIndex": index,
+        "rootPublicKey": bytes(pk), "vendorId": 4996, "fabricId": 1,
+        "nodeId": node_id, "label": label, "fabricIndex": index,
     })
 }
 
@@ -175,18 +179,23 @@ fn build_fixture_with_ca(root: &Path, ca: (Vec<u8>, Vec<u8>)) -> Fixture {
     seg1.push(json!({"ts": 1, "ops": [{"op": "del", "key": "decoy", "values": ["gone"]}]}).to_string());
     seg1.push(json!({"ts": 2, "ops": [{"op": "del", "key": "decoy"}]}).to_string());
     // Device fabric tables: node 10 is the spec's multi-admin trap.
-    seg1.push(upd_line("nodes.peer10.endpoints.0.62", json!({"1": [
-        fabric_entry(&foreign_root_pk(0xBB), 1, "Mijn huis"),
-        fabric_entry(&foreign_root_pk(0xCC), 2, ""),
-        fabric_entry(&f.root_public_key, 3, "HomeAssistant"),
+    // Device fabric tables live under matter.js PEER INDEXES (peer1..peer4
+    // here), which deliberately do NOT match the node ids (10, 12, 21, 22) —
+    // exactly the reference store's layout, where peer1 holds node 8. The
+    // matcher must join on each entry's own nodeId. Node 10 is the
+    // multi-admin trap: ours at index 3 behind two foreign fabrics.
+    seg1.push(upd_line("nodes.peer1.endpoints.0.62", json!({"1": [
+        fabric_entry(&foreign_root_pk(0xBB), 594_449_053, 1, "Mijn huis"),
+        fabric_entry(&foreign_root_pk(0xCC), 4_229_828_025, 2, ""),
+        fabric_entry(&f.root_public_key, 10, 3, "HomeAssistant"),
     ]})));
-    seg1.push(upd_line("nodes.peer12.endpoints.0.62", json!({"1": [fabric_entry(&f.root_public_key, 2, "HomeAssistant")]})));
+    seg1.push(upd_line("nodes.peer2.endpoints.0.62", json!({"1": [fabric_entry(&f.root_public_key, 12, 2, "HomeAssistant")]})));
     std::fs::write(wal.join("00000001.jsonl"), seg1.join("\n")).unwrap();
 
     // Segment 2, gzipped: the remaining device caches. Node 23 gets none.
     let seg2 = [
-        upd_line("nodes.peer21.endpoints.0.62", json!({"1": [fabric_entry(&f.root_public_key, 2, "HomeAssistant")]})),
-        upd_line("nodes.peer22.endpoints.0.62", json!({"1": [fabric_entry(&f.root_public_key, 4, "HomeAssistant")]})),
+        upd_line("nodes.peer3.endpoints.0.62", json!({"1": [fabric_entry(&f.root_public_key, 21, 2, "HomeAssistant")]})),
+        upd_line("nodes.peer4.endpoints.0.62", json!({"1": [fabric_entry(&f.root_public_key, 22, 4, "HomeAssistant")]})),
     ]
     .join("\n");
     std::fs::write(wal.join("00000002.jsonl.gz"), gz(seg2.as_bytes())).unwrap();

@@ -197,70 +197,83 @@ pub fn read_source_fabric(db: &JsDb) -> Result<SourceFabric, ConvertError> {
     })
 }
 
-/// Match a node's cached Operational Credentials `fabrics` attribute
-/// (`nodes.peer{node_id}.endpoints.0.62` field `"1"`) against our root public
-/// key. Best-effort: zero, multiple, out-of-range, or unparseable results all
-/// fall back to index 0 with a full-sentence reason — never an abort, never a
+/// Scan every cached Operational Credentials `fabrics` attribute
+/// (`nodes.peer<K>.endpoints.0.62` field `"1"`) and collect, from the entries
+/// carrying our root public key, the device's operational node id on our
+/// fabric → its `fabricIndex`.
+///
+/// `<K>` is matter.js's **peer index, not the node id** — verified on the
+/// reference store, where `nodes.peer1…` holds the device commissioned as
+/// node 8. The join key is therefore the `nodeId` field INSIDE the matching
+/// fabric entry (the device reports its own operational node id per fabric),
+/// never the context name.
+///
+/// Best-effort throughout: an unparseable entry is skipped; a node id claimed
+/// twice with different indexes, or with an out-of-range index, resolves to a
+/// refusal (`Err(reason)`) — the caller writes 0. Never an abort, never a
 /// guess.
-fn match_fabric_index(db: &JsDb, node_id: u64, root_public_key: &[u8]) -> (u8, FabricIndexSource) {
-    let context = format!("nodes.peer{node_id}.endpoints.0.62");
-    let Some(fabrics_value) = db.field(&context, "1") else {
-        return (
-            0,
-            FabricIndexSource::FallbackZero(format!(
-                "no cached fabrics attribute at {context} — removing this device will leave our fabric behind on it"
-            )),
-        );
-    };
-    let Some(array) = fabrics_value.as_array() else {
-        return (
-            0,
-            FabricIndexSource::FallbackZero(format!(
-                "cached fabrics attribute at {context} is not an array — removing this device will leave our fabric behind on it"
-            )),
-        );
-    };
+fn fabric_index_by_node_id(
+    db: &JsDb,
+    root_public_key: &[u8],
+) -> std::collections::BTreeMap<u64, Result<u8, String>> {
+    let mut map: std::collections::BTreeMap<u64, Result<u8, String>> =
+        std::collections::BTreeMap::new();
 
-    let mut matches: Vec<u64> = Vec::new();
-    for entry in array {
-        let Some(obj) = entry.as_object() else { continue };
-        let Some(pk_value) = obj.get("rootPublicKey") else { continue };
-        let Ok(pk) = decode::as_bytes(pk_value) else { continue };
-        if pk != root_public_key {
+    for context in db.context_keys() {
+        if !(context.starts_with("nodes.peer") && context.ends_with(".endpoints.0.62")) {
             continue;
         }
-        let Some(index_value) = obj.get("fabricIndex") else { continue };
-        let Ok(index) = decode::as_u64(index_value) else { continue };
-        matches.push(index);
-    }
+        let Some(fabrics_value) = db.field(context, "1") else { continue };
+        let Some(array) = fabrics_value.as_array() else { continue };
+        for entry in array {
+            let Some(obj) = entry.as_object() else { continue };
+            let Some(pk_value) = obj.get("rootPublicKey") else { continue };
+            let Ok(pk) = decode::as_bytes(pk_value) else { continue };
+            if pk != root_public_key {
+                continue;
+            }
+            let (Some(node_id_value), Some(index_value)) =
+                (obj.get("nodeId"), obj.get("fabricIndex"))
+            else {
+                continue;
+            };
+            let (Ok(node_id), Ok(index)) =
+                (decode::as_u64(node_id_value), decode::as_u64(index_value))
+            else {
+                continue;
+            };
 
-    match matches.len() {
-        1 => {
-            let index = matches[0];
-            if (1..=254).contains(&index) {
-                (index as u8, FabricIndexSource::MatchedByRootPublicKey)
-            } else {
-                (
-                    0,
-                    FabricIndexSource::FallbackZero(format!(
-                        "the cached fabric entry matching our root public key has an out-of-range fabricIndex {index}"
+            if !(1..=254).contains(&index) {
+                map.insert(
+                    node_id,
+                    Err(format!(
+                        "the cached fabric entry for this node (at {context}) has an out-of-range fabricIndex {index}"
                     )),
-                )
+                );
+                continue;
+            }
+            let index = index as u8;
+            match map.get(&node_id) {
+                None => {
+                    map.insert(node_id, Ok(index));
+                }
+                // The same claim twice (e.g. a stale duplicate cache) is fine.
+                Some(Ok(prev)) if *prev == index => {}
+                Some(Ok(_)) => {
+                    map.insert(
+                        node_id,
+                        Err(format!(
+                            "two cached fabric tables claim node {node_id} on our fabric with different fabric indexes; refusing to pick"
+                        )),
+                    );
+                }
+                // Already refused; keep the first reason.
+                Some(Err(_)) => {}
             }
         }
-        0 => (
-            0,
-            FabricIndexSource::FallbackZero(
-                "no fabric in the cached table carries our root public key".to_string(),
-            ),
-        ),
-        n => (
-            0,
-            FabricIndexSource::FallbackZero(format!(
-                "{n} fabrics in the cached table carry our root public key; refusing to pick"
-            )),
-        ),
     }
+
+    map
 }
 
 /// Build the planned `NodeRecord`s from `nodes.commissionedNodes`. An absent
@@ -274,6 +287,8 @@ pub fn plan_nodes(db: &JsDb, root_public_key: &[u8]) -> Result<Vec<NodePlan>, Co
         context: "nodes.commissionedNodes".to_string(),
         source,
     })?;
+
+    let index_by_node = fabric_index_by_node_id(db, root_public_key);
 
     let mut plans = Vec::with_capacity(entries.len());
     for (key, value) in entries {
@@ -297,7 +312,24 @@ pub fn plan_nodes(db: &JsDb, root_public_key: &[u8]) -> Result<Vec<NodePlan>, Co
             None => Vec::new(),
         };
 
-        let (device_fabric_index, fabric_index) = match_fabric_index(db, node_id, root_public_key);
+        let (device_fabric_index, fabric_index) = match index_by_node.get(&node_id) {
+            Some(Ok(index)) => (*index, FabricIndexSource::MatchedByRootPublicKey),
+            Some(Err(reason)) => (
+                0,
+                FabricIndexSource::FallbackZero(format!(
+                    "{reason} — removing this device will leave our fabric behind on it"
+                )),
+            ),
+            None => (
+                0,
+                FabricIndexSource::FallbackZero(
+                    "no cached fabric table names this node on our fabric (searched every \
+                     nodes.peer*.endpoints.0.62 cache) — removing this device will leave our \
+                     fabric behind on it"
+                        .to_string(),
+                ),
+            ),
+        };
 
         plans.push(NodePlan {
             record: NodeRecord {
@@ -362,12 +394,16 @@ mod tests {
         pk
     }
 
-    fn fabric_entry(pk: &[u8], index: u64, label: &str) -> Value {
+    /// A cached fabric-table entry, in the shape observed on the reference
+    /// store: `rootPublicKey` is a tagged Uint8Array; the scalars are PLAIN
+    /// numbers (not BigInt-tagged). `node_id` is the device's operational
+    /// node id ON THAT FABRIC — the join key the matcher relies on.
+    fn fabric_entry(pk: &[u8], node_id: u64, index: u64, label: &str) -> Value {
         json!({
             "rootPublicKey": bytes(pk),
             "vendorId": 4996,
-            "fabricId": bigint(1),
-            "nodeId": bigint(112233),
+            "fabricId": 1,
+            "nodeId": node_id,
             "label": label,
             "fabricIndex": index,
         })
@@ -459,20 +495,26 @@ mod tests {
                 commissioned(23, None, None),
             ]),
         })));
-        // node 10: three fabrics cached; OURS (root pk 0xAA) at index 3 — the
-        // spec's peer1 scenario, where guessing "1" would evict "Mijn huis".
-        data.insert("nodes.peer10.endpoints.0.62".to_string(), obj(json!({
+        // Peer cache contexts are keyed by matter.js's PEER INDEX, which has
+        // nothing to do with the node id (on the reference store, peer1 holds
+        // node 8). The matcher must join on the entry's own nodeId field.
+        //
+        // peer1 = node 10: three fabrics cached; OURS (root pk 0xAA) at
+        // index 3 — the reference-store scenario, where guessing "1" would
+        // evict "Mijn huis". Foreign entries carry foreign node ids.
+        data.insert("nodes.peer1.endpoints.0.62".to_string(), obj(json!({
             "1": [
-                fabric_entry(&root_pk(0xBB), 1, "Mijn huis"),
-                fabric_entry(&root_pk(0xCC), 2, ""),
-                fabric_entry(&root_pk(0xAA), 3, "HomeAssistant"),
+                fabric_entry(&root_pk(0xBB), 594_449_053, 1, "Mijn huis"),
+                fabric_entry(&root_pk(0xCC), 4_229_828_025, 2, ""),
+                fabric_entry(&root_pk(0xAA), 10, 3, "HomeAssistant"),
             ],
         })));
-        // node 22: cache exists but no entry matches our root -> fallback 0.
-        data.insert("nodes.peer22.endpoints.0.62".to_string(), obj(json!({
-            "1": [fabric_entry(&root_pk(0xBB), 1, "Mijn huis")],
+        // peer2 = node 22: cache exists but no entry matches our root ->
+        // fallback 0 (the foreign entry's nodeId 22 must NOT be trusted).
+        data.insert("nodes.peer2.endpoints.0.62".to_string(), obj(json!({
+            "1": [fabric_entry(&root_pk(0xBB), 22, 1, "Mijn huis")],
         })));
-        // node 23: no cache at all -> fallback 0.
+        // node 23: no cache names it at all -> fallback 0.
         data
     }
 
@@ -493,7 +535,7 @@ mod tests {
 
         let n22 = &plans[1];
         assert_eq!(n22.record.device_fabric_index, 0);
-        assert!(matches!(&n22.fabric_index, FabricIndexSource::FallbackZero(r) if r.contains("root public key")));
+        assert!(matches!(&n22.fabric_index, FabricIndexSource::FallbackZero(r) if r.contains("names this node on our fabric")));
         // bracket-free per controller::addr, scope id kept
         assert_eq!(n22.record.addresses, vec!["fe80::1%eth1".to_string()]);
 
@@ -507,18 +549,31 @@ mod tests {
     /// as none, and an out-of-range fabricIndex cannot be "clamped" into use.
     #[test]
     fn ambiguous_or_invalid_matches_fall_back_to_zero() {
+        // Two caches claim node 10 on our fabric with DIFFERENT indexes.
         let mut data = store_with_nodes();
-        data.insert("nodes.peer10.endpoints.0.62".to_string(), obj(json!({
-            "1": [fabric_entry(&root_pk(0xAA), 2, "a"), fabric_entry(&root_pk(0xAA), 3, "b")],
+        data.insert("nodes.peer7.endpoints.0.62".to_string(), obj(json!({
+            "1": [fabric_entry(&root_pk(0xAA), 10, 5, "b")],
         })));
         let plans = plan_nodes(&JsDb::from_data(data), &root_pk(0xAA)).unwrap();
         assert_eq!(plans[0].record.device_fabric_index, 0);
-        assert!(matches!(&plans[0].fabric_index, FabricIndexSource::FallbackZero(_)));
+        assert!(
+            matches!(&plans[0].fabric_index, FabricIndexSource::FallbackZero(r) if r.contains("refusing to pick")),
+            "{:?}",
+            plans[0].fabric_index
+        );
+
+        // ...but the SAME claim twice (a stale duplicate cache) still matches.
+        let mut data = store_with_nodes();
+        data.insert("nodes.peer7.endpoints.0.62".to_string(), obj(json!({
+            "1": [fabric_entry(&root_pk(0xAA), 10, 3, "dup")],
+        })));
+        let plans = plan_nodes(&JsDb::from_data(data), &root_pk(0xAA)).unwrap();
+        assert_eq!(plans[0].record.device_fabric_index, 3);
 
         for bad_index in [0u64, 255, 300] {
             let mut data = store_with_nodes();
-            data.insert("nodes.peer10.endpoints.0.62".to_string(), obj(json!({
-                "1": [fabric_entry(&root_pk(0xAA), bad_index, "x")],
+            data.insert("nodes.peer1.endpoints.0.62".to_string(), obj(json!({
+                "1": [fabric_entry(&root_pk(0xAA), 10, bad_index, "x")],
             })));
             let plans = plan_nodes(&JsDb::from_data(data), &root_pk(0xAA)).unwrap();
             assert_eq!(plans[0].record.device_fabric_index, 0, "for index {bad_index}");
@@ -526,8 +581,8 @@ mod tests {
 
         // An unparseable cache entry is a fallback REASON, not an abort.
         let mut data = store_with_nodes();
-        data.insert("nodes.peer10.endpoints.0.62".to_string(), obj(json!({
-            "1": [{"rootPublicKey": "not tagged", "fabricIndex": 3}],
+        data.insert("nodes.peer1.endpoints.0.62".to_string(), obj(json!({
+            "1": [{"rootPublicKey": "not tagged", "nodeId": 10, "fabricIndex": 3}],
         })));
         let plans = plan_nodes(&JsDb::from_data(data), &root_pk(0xAA)).unwrap();
         assert_eq!(plans[0].record.device_fabric_index, 0);
