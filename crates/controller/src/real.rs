@@ -224,7 +224,8 @@ pub(crate) mod test_rig {
     }
 
     pub fn identity() -> ServerIdentity {
-        ServerIdentity { fabric_id: 1, vendor_id: 0xFFF1, controller_node_id: 112233,
+        ServerIdentity { version: crate::storage::IDENTITY_VERSION,
+            fabric_id: 1, vendor_id: 0xFFF1, controller_node_id: 112233,
             compressed_fabric_id: 0xC0FFEE, ca_private_key: vec![], rcac_tlv: vec![],
             controller_private_key: vec![], controller_noc_tlv: vec![], ipk: vec![] }
     }
@@ -410,7 +411,7 @@ mod tests {
             scope.spawn(move || {
                 block_on_current_thread(async {
                     for i in 0..N {
-                        c.update_config(|cfg| {
+                        let _ = c.update_config(|cfg| {
                             cfg.wifi_credentials.insert(
                                 format!("wifi{i}"),
                                 WifiCredential { ssid: format!("ssid{i}"), password: "pw".into() },
@@ -423,7 +424,7 @@ mod tests {
             scope.spawn(move || {
                 block_on_current_thread(async {
                     for i in 0..N {
-                        c.update_config(|cfg| {
+                        let _ = c.update_config(|cfg| {
                             cfg.thread_datasets.insert(format!("thread{i}"), "0e08".into());
                         })
                         .await;

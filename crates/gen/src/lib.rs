@@ -49,6 +49,19 @@ impl Cluster {
 mod tests {
     use super::*;
 
+    /// `cluster()`'s `binary_search_by_key` is only correct on a table that is
+    /// strictly ascending by code (which also rules out duplicate clusters).
+    /// `build.rs` sorts, so this holds today — the test makes it a property rather
+    /// than a coincidence, the way `vendors::table_is_strictly_ascending_by_id`
+    /// does for the other generated table.
+    #[test]
+    fn table_is_strictly_ascending_by_code() {
+        assert!(
+            CLUSTERS.windows(2).all(|w| w[0].code < w[1].code),
+            "CLUSTERS must be strictly ascending by code (also rules out duplicates)"
+        );
+    }
+
     #[test]
     fn onoff_commands() {
         let c = cluster(6).expect("OnOff cluster");

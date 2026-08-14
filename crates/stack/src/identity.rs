@@ -100,7 +100,9 @@ pub fn ensure_identity<C: Crypto>(
                 // A fabric nothing can reproduce after a restart is worse than
                 // no fabric: back it out so the failure is clean.
                 if let Err(e) = matter.with_state(|s| s.fabrics.remove(fab_idx)) {
-                    tracing::warn!("could not roll back fabric {fab_idx} after a failed write: {e:?}");
+                    // `Error::{e}`, never `{e:?}`: rs-matter is built with
+                    // `backtrace`, so its `Debug` dumps a whole captured backtrace.
+                    tracing::warn!("could not roll back fabric {fab_idx} after a failed write: Error::{e}");
                 }
                 return Err(e.into());
             }
@@ -117,7 +119,8 @@ pub fn ensure_identity<C: Crypto>(
         tracing::warn!("fabric label {fabric_label:?} exceeds {FABRIC_LABEL_MAX_BYTES} bytes; using {label:?}");
     }
     if let Err(e) = matter.with_state(|s| s.fabrics.update_label(fab_idx, label).map(|_| ())) {
-        tracing::warn!("could not set fabric label {label:?}: {e:?}");
+        // Same reason: a cosmetic label failure must not print a backtrace.
+        tracing::warn!("could not set fabric label {label:?}: Error::{e}");
     }
 
     Ok((identity, fab_idx))
@@ -140,6 +143,37 @@ fn install<C: Crypto>(
             id.controller_node_id
         );
         return Err(ErrorCode::InvalidData.into());
+    }
+
+    // The same shape for `fabric_id`, but a WARNING — never an error, never an
+    // auto-correction. The certificates are the operative truth either way:
+    // `NocGenerator::create` takes the fabric id from the RCAC
+    // (`rs-matter-ref/rs-matter/src/onboard/noc.rs:111`) and `Fabric::update`
+    // reads it back out of the NOC (`fabric.rs:687`) to derive the compressed
+    // fabric id, so the stored scalar is only ever a *copy* — one that reaches
+    // Home Assistant verbatim in `server_info`.
+    //
+    // Erroring would refuse to boot an install whose CASE sessions work fine
+    // (unlike `controller_node_id`, which rs-matter takes on trust as the CASE
+    // admin subject and which therefore has to be fatal), and silently correcting
+    // it would contradict the "a stored identity always wins over the CLI flags"
+    // warning in `ensure_identity`. So: say it once, clearly, and leave the call
+    // to the operator.
+    //
+    // Only a *mismatch* warns. An RCAC with no FabricId in its subject DN is
+    // spec-legal (ours always has one), so absence is silence rather than noise,
+    // and an unreadable RCAC is reported by `fabrics.add` below.
+    if let Ok(rcac_fabric_id) = CertRef::new(TLVElement::new(&id.rcac_tlv)).get_fabric_id() {
+        if rcac_fabric_id != id.fabric_id {
+            tracing::warn!(
+                "stored fabric_id {} does not match the {rcac_fabric_id} in the stored RCAC. The \
+                 certificates are what CASE actually uses, so the fabric still works; the stored \
+                 scalar is only what server_info reports to Home Assistant. Nothing is corrected \
+                 automatically — a stored identity always wins here, and rewriting server.json on \
+                 a boot-time guess is not something to do behind your back.",
+                id.fabric_id
+            );
+        }
     }
 
     // References, not owned copies: nothing here needs a second copy of the
@@ -216,6 +250,7 @@ fn finish_identity<C: Crypto>(
     crypto.rand()?.fill_bytes(ipk.access_mut());
 
     Ok(ServerIdentity {
+        version: matter_rs_controller::storage::IDENTITY_VERSION,
         fabric_id,
         vendor_id,
         controller_node_id: CONTROLLER_NODE_ID,
@@ -564,6 +599,41 @@ mod tests {
         tampered.controller_node_id = CONTROLLER_NODE_ID + 1;
         storage.save_identity(&tampered).unwrap();
         assert!(ensure_identity(init(&M2), &crypto, &storage, 1, 0xFFF1, "HA").is_err());
+    }
+
+    /// The `fabric_id` counterpart of the check above, and deliberately the
+    /// opposite outcome: a stored `fabric_id` that disagrees with the certificates
+    /// only affects what `server_info` reports, so it warns and boots. Erroring
+    /// would strand an install whose CASE sessions are fine, and correcting it
+    /// silently would contradict "a stored identity always wins over the flags".
+    ///
+    /// The log line itself is not asserted (no subscriber here — same approach as
+    /// `a_stored_non_canonical_rcac_still_boots...`): what is asserted is that the
+    /// boot succeeds and that nothing on disk was touched.
+    #[test]
+    fn a_stored_fabric_id_that_disagrees_with_the_rcac_warns_but_still_boots() {
+        static M1: StaticCell<Matter> = StaticCell::new();
+        static M2: StaticCell<Matter> = StaticCell::new();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(dir.path()).unwrap();
+        let crypto = default_crypto(rand::thread_rng(), DAC_PRIVKEY);
+        ensure_identity(init(&M1), &crypto, &storage, 1, 0xFFF1, "HA").unwrap();
+
+        let mut tampered = storage.load_identity().unwrap().unwrap();
+        tampered.fabric_id = 999;
+        storage.save_identity(&tampered).unwrap();
+        // The condition the warning fires on: the RCAC still says 1.
+        assert_eq!(
+            CertRef::new(TLVElement::new(&tampered.rcac_tlv)).get_fabric_id().unwrap(),
+            1
+        );
+
+        let (loaded, _) = ensure_identity(init(&M2), &crypto, &storage, 1, 0xFFF1, "HA")
+            .expect("a fabric_id mismatch must not keep the controller from starting");
+        // Warn-only: not corrected in memory...
+        assert_eq!(loaded.fabric_id, 999);
+        // ...and not rewritten on disk either.
+        assert_eq!(storage.load_identity().unwrap().unwrap().fabric_id, 999);
     }
 
     /// Task 19's live-device finding, pinned: rs-matter emits the RCAC's random

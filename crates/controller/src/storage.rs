@@ -21,8 +21,24 @@ mod b64 {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Format version written into every `server.json`.
+///
+/// It exists so that a *future* field can be added at all. `ServerIdentity` has
+/// no container-level serde default by design — a missing field is a hard boot
+/// error, pinned by `identity_load_is_strict_config_and_nodes_stay_lenient` —
+/// which means adding any field later would be a hard boot failure for every
+/// existing install. Nothing branches on this value yet, deliberately: the
+/// migration hook has to be on disk *before* it is needed, and a version that
+/// changes behaviour today would be a second thing to get right.
+pub const IDENTITY_VERSION: u32 = 1;
+
+fn default_identity_version() -> u32 { IDENTITY_VERSION }
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ServerIdentity {
+    /// See [`IDENTITY_VERSION`]. Defaulted (the only defaulted field here) so
+    /// that a `server.json` written before this field existed still loads.
+    #[serde(default = "default_identity_version")] pub version: u32,
     pub fabric_id: u64,
     pub vendor_id: u16,
     pub controller_node_id: u64,
@@ -32,6 +48,33 @@ pub struct ServerIdentity {
     #[serde(with = "b64")] pub controller_private_key: Vec<u8>,
     #[serde(with = "b64")] pub controller_noc_tlv: Vec<u8>,
     #[serde(with = "b64")] pub ipk: Vec<u8>,
+}
+
+/// Hand-written, NOT derived: `ca_private_key`, `controller_private_key` and
+/// `ipk` are raw `Vec<u8>`, so a derived `Debug` prints the fabric's trust anchor
+/// byte by byte. One future `tracing::debug!("{ready:?}")` on `stack::ReadyInfo`
+/// — which is `pub`, holds this, and derives `Debug` — would be enough to put the
+/// CA key in a log file. Nothing reaches it today; this makes it impossible
+/// rather than merely unattempted.
+///
+/// The certificates are public, so they are not redacted, just summarised: their
+/// bytes are noise in a log and their *length* is what a debug print is for.
+impl std::fmt::Debug for ServerIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerIdentity")
+            .field("version", &self.version)
+            .field("fabric_id", &self.fabric_id)
+            .field("vendor_id", &self.vendor_id)
+            .field("controller_node_id", &self.controller_node_id)
+            .field("compressed_fabric_id", &self.compressed_fabric_id)
+            .field("ca_private_key", &format_args!("[redacted; {} bytes]", self.ca_private_key.len()))
+            .field("rcac_tlv", &format_args!("[{} bytes]", self.rcac_tlv.len()))
+            .field("controller_private_key",
+                   &format_args!("[redacted; {} bytes]", self.controller_private_key.len()))
+            .field("controller_noc_tlv", &format_args!("[{} bytes]", self.controller_noc_tlv.len()))
+            .field("ipk", &format_args!("[redacted; {} bytes]", self.ipk.len()))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +322,7 @@ mod tests {
         let s = Storage::open(d.path()).unwrap();
         assert!(s.load_identity().unwrap().is_none());
         let id = ServerIdentity {
+            version: IDENTITY_VERSION,
             fabric_id: 1, vendor_id: 0xFFF1, controller_node_id: 112233,
             compressed_fabric_id: 0xDEADBEEF,
             ca_private_key: vec![1; 32], rcac_tlv: vec![2; 40],
@@ -323,6 +367,7 @@ mod tests {
 
         // create_identity never clobbers.
         let id = ServerIdentity {
+            version: IDENTITY_VERSION,
             fabric_id: 1, vendor_id: 0xFFF1, controller_node_id: 112233,
             compressed_fabric_id: 7, ca_private_key: vec![1; 32], rcac_tlv: vec![2; 40],
             controller_private_key: vec![3; 32], controller_noc_tlv: vec![4; 40], ipk: vec![5; 16],
@@ -338,6 +383,70 @@ mod tests {
         assert_eq!(s.load_config().fabric_label, ConfigData::default().fabric_label);
         std::fs::write(d.path().join("nodes").join("9.json"), b"{ not json").unwrap();
         assert!(s.load_nodes().is_empty());
+    }
+
+    fn sample_identity() -> ServerIdentity {
+        ServerIdentity {
+            version: IDENTITY_VERSION,
+            fabric_id: 1, vendor_id: 0xFFF1, controller_node_id: 112233,
+            compressed_fabric_id: 0xDEADBEEF,
+            ca_private_key: vec![0xAB; 32], rcac_tlv: vec![0x11; 40],
+            controller_private_key: vec![0xCD; 32], controller_noc_tlv: vec![0x22; 40],
+            ipk: vec![0xEF; 16],
+        }
+    }
+
+    /// `ServerIdentity`'s `Debug` is hand-written so that no future `{:?}` — most
+    /// plausibly on `stack::ReadyInfo`, which is `pub`, holds this and derives
+    /// `Debug` — can put the fabric's trust anchor in a log file.
+    #[test]
+    fn identity_debug_redacts_every_secret() {
+        let printed = format!("{:?}", sample_identity());
+        // The three secrets, in either spelling a Debug impl could produce. Runs
+        // of three for the hex form: a bare "ab" also occurs inside "fabric_id".
+        for byte in [0xABu8, 0xCD, 0xEF] {
+            assert!(!printed.contains(&format!("{byte}")), "decimal byte {byte:#x} leaked: {printed}");
+            assert!(!printed.to_lowercase().contains(&format!("{byte:02x}").repeat(3)),
+                    "hex byte {byte:#x} leaked: {printed}");
+        }
+        assert_eq!(printed.matches("[redacted; ").count(), 3);
+        assert!(printed.contains("[redacted; 32 bytes]")); // the two P-256 keys
+        assert!(printed.contains("[redacted; 16 bytes]")); // the IPK
+        // Still useful: the non-secret scalars survive.
+        assert!(printed.contains("fabric_id: 1"));
+        assert!(printed.contains("controller_node_id: 112233"));
+        assert!(printed.contains("version: 1"));
+    }
+
+    /// The migration trap `version` exists to defuse: `ServerIdentity` has no
+    /// container-level serde default (a missing field is a hard error — see
+    /// `identity_load_is_strict_config_and_nodes_stay_lenient`), so a field added
+    /// later would be a hard boot failure for every existing install. This one is
+    /// defaulted, so a `server.json` written before it existed still loads.
+    #[test]
+    fn identity_version_is_written_and_defaults_when_absent() {
+        let d = tmp();
+        let s = Storage::open(d.path()).unwrap();
+        let server = d.path().join("server.json");
+        s.save_identity(&sample_identity()).unwrap();
+
+        // What we write carries it...
+        let raw: Value = serde_json::from_str(&std::fs::read_to_string(&server).unwrap()).unwrap();
+        assert_eq!(raw["version"], IDENTITY_VERSION);
+
+        // ...and a file predating the field still loads, with everything else intact.
+        let mut obj = raw.as_object().unwrap().clone();
+        obj.remove("version");
+        std::fs::write(&server, serde_json::to_string_pretty(&obj).unwrap()).unwrap();
+        let loaded = s.load_identity().unwrap().unwrap();
+        assert_eq!(loaded.version, IDENTITY_VERSION);
+        assert_eq!(loaded.compressed_fabric_id, 0xDEADBEEF);
+        assert_eq!(loaded.ipk, vec![0xEF; 16]);
+
+        // Every OTHER field stays strict: dropping one is still a hard error.
+        obj.remove("ipk");
+        std::fs::write(&server, serde_json::to_string_pretty(&obj).unwrap()).unwrap();
+        assert_eq!(s.load_identity().unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     /// Every writer needs its OWN temp path. Sharing `.config.json.tmp-<pid>`
@@ -356,9 +465,11 @@ mod tests {
             for w in 0..4 {
                 scope.spawn(move || {
                     for i in 0..50u64 {
-                        let mut cfg = ConfigData::default();
-                        cfg.fabric_label = format!("writer{w}");
-                        cfg.next_node_id = 1000 + i;
+                        let cfg = ConfigData {
+                            fabric_label: format!("writer{w}"),
+                            next_node_id: 1000 + i,
+                            ..Default::default()
+                        };
                         s.save_config(&cfg).expect("atomic write must not fail");
                         // Any intermediate state must still parse: a torn file
                         // comes back as the default label instead.
