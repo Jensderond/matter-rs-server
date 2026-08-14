@@ -34,6 +34,14 @@ pub const CONTROLLER_NODE_ID: u64 = 112233;
 /// label is capped at 32 *chars* (Node-compatible, deliberately).
 pub(crate) const FABRIC_LABEL_MAX_BYTES: usize = 32;
 
+/// How many RCACs to draw before giving up on finding one a strict peer will
+/// accept. See [`serial_is_der_canonical`] for why a draw can be unusable;
+/// `RcacGenerator` picks the serial number from 8 random bytes, so a bit over
+/// half of all draws are fine and 16 attempts leaves a ~1-in-65000 residual.
+/// Each attempt costs one P-256 keygen plus one signature, and this runs exactly
+/// once in the lifetime of an installation.
+const RCAC_DRAW_ATTEMPTS: usize = 16;
+
 /// Load-or-generate the controller identity and install it as a fabric on the
 /// Matter instance. Returns the identity — freshly written to `server.json` on
 /// first run, otherwise the stored one — and the local fabric index.
@@ -171,9 +179,8 @@ pub(crate) fn truncate_to_bytes(s: &str, max_bytes: usize) -> &str {
 /// Mint a fresh CA chain and controller NOC. The generated blobs are all the
 /// caller needs to reproduce this fabric on a later start.
 fn generate<C: Crypto>(crypto: &C, fabric_id: u64, vendor_id: u16) -> Result<ServerIdentity, Error> {
-    let mut rcac_buf = [0u8; MAX_CERT_TLV_AND_ASN1_LEN];
-    let mut rcac_gen = RcacGenerator::new(&mut rcac_buf);
-    let (rcac_priv, rcac) = rcac_gen.generate(crypto, fabric_id, VALID_FOREVER)?;
+    let (rcac_priv, rcac) = generate_usable_rcac(crypto, fabric_id)?;
+    let rcac = rcac.as_slice();
 
     // Controller operational keypair -> CSR -> NOC signed by the RCAC.
     let controller_secret_key = crypto.generate_secret_key()?;
@@ -202,6 +209,87 @@ fn generate<C: Crypto>(crypto: &C, fabric_id: u64, vendor_id: u16) -> Result<Ser
         controller_noc_tlv: controller_noc.to_vec(),
         ipk: ipk.access().to_vec(),
     })
+}
+
+/// Draw RCACs until one lands with a serial number a strict DER peer will
+/// accept, returning `(private key, TLV bytes)`.
+///
+/// **Why this loop exists.** `RcacGenerator` fills the serial number with 8
+/// random bytes and rs-matter's ASN.1 writer emits them verbatim as the X.509
+/// `serialNumber` INTEGER (`rs-matter-ref/rs-matter/src/cert/asn1_writer.rs:183`
+/// — `integer()` is `write_str(0x02, i)`, with no sign handling). A serial whose
+/// top bit is set therefore encodes as a *negative* DER integer. rs-matter signs
+/// its own conversion, so it verifies its own certs happily; a peer that
+/// re-encodes the Matter TLV to DER itself inserts the `0x00` sign pad DER
+/// requires, hashes a different TBS certificate, and rejects the RCAC. matter.js
+/// does exactly that in `Rcac.verify` and answers `AddTrustedRootCertificate`
+/// with status 0x85 and "Signature verification failed", after which `AddNOC`
+/// fails "Root certificate not found" — observed on ~half of all fresh
+/// identities before this loop existed.
+///
+/// This is spike finding 1's real cause, and it is upstream's bug, not ours:
+/// `NocGenerator::encode_serial_asn1` (`onboard/noc.rs:237`) pads correctly, so
+/// NOCs were never affected, and the finding's "rs-matter's ICAC encoding" theory
+/// was really the same unpadded-serial coin flip in `IcacGenerator`. Redrawing is
+/// the smallest fix available to a downstream caller: `RcacGenerator` does not
+/// take a serial, and reaching past it to `CertGenerator` would mean owning the
+/// whole RCAC subject/issuer/extension layout here.
+fn generate_usable_rcac<C: Crypto>(
+    crypto: &C,
+    fabric_id: u64,
+) -> Result<(CanonPkcSecretKey, Vec<u8>), Error> {
+    // Kept so a *persistent* failure (a broken RNG, say) surfaces as its own
+    // error rather than as "ran out of attempts".
+    let mut last_err: Option<Error> = None;
+
+    for draw in 1..=RCAC_DRAW_ATTEMPTS {
+        let mut rcac_buf = [0u8; MAX_CERT_TLV_AND_ASN1_LEN];
+        let mut rcac_gen = RcacGenerator::new(&mut rcac_buf);
+        // rs-matter's own `validate_serial_number` rejects the redundant-leading-
+        // zero draws (`cert/gen.rs:380`), so an error here is usually just another
+        // unlucky serial — retry rather than fail the whole bootstrap on it.
+        let (rcac_priv, rcac) = match rcac_gen.generate(crypto, fabric_id, VALID_FOREVER) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("RCAC draw {draw} was rejected by rs-matter: Error::{e}");
+                last_err = Some(e);
+                continue;
+            }
+        };
+        if serial_is_der_canonical(rcac)? {
+            return Ok((rcac_priv, rcac.to_vec()));
+        }
+        tracing::debug!("RCAC draw {draw} has a serial number strict DER peers would reject");
+    }
+
+    tracing::error!(
+        "no usable RCAC serial number in {RCAC_DRAW_ATTEMPTS} draws — refusing to persist a \
+         fabric that strict peers such as matter.js would reject"
+    );
+    Err(last_err.unwrap_or_else(|| ErrorCode::InvalidData.into()))
+}
+
+/// Whether a Matter-TLV certificate's serial number is *already* the minimal
+/// positive DER INTEGER encoding of itself, i.e. whether re-encoding it under the
+/// DER rules is a no-op.
+///
+/// Since rs-matter writes those bytes through unchanged, this is exactly the
+/// condition under which the TBS certificate it signed matches the one a peer
+/// that re-encodes properly will hash. Two ways to fail: the top bit is set (the
+/// value reads as negative, so a strict encoder prepends `0x00`), or there is a
+/// redundant leading zero (a strict encoder strips it). rs-matter refuses to
+/// generate the second case, but it is checked here anyway rather than relying on
+/// a private function inside a pinned dependency.
+fn serial_is_der_canonical(cert_tlv: &[u8]) -> Result<bool, Error> {
+    // Context tag 1 of the certificate struct (`CertTag::SerialNum`);
+    // `CertRef::serial_no` is private, so read the element directly.
+    let serial = TLVElement::new(cert_tlv).structure()?.find_ctx(1)?.str()?;
+    let Some(&first) = serial.first() else { return Ok(false) };
+    if first & 0x80 != 0 {
+        return Ok(false);
+    }
+    // `[0x00]` alone is fine — it is zero, not a padded value.
+    Ok(!(first == 0 && serial.get(1).is_some_and(|b| b & 0x80 == 0)))
 }
 
 /// Rebuild an owned P-256 secret key from its persisted canonical bytes.
@@ -426,6 +514,59 @@ mod tests {
         tampered.controller_node_id = CONTROLLER_NODE_ID + 1;
         storage.save_identity(&tampered).unwrap();
         assert!(ensure_identity(init(&M2), &crypto, &storage, 1, 0xFFF1, "HA").is_err());
+    }
+
+    /// Task 19's live-device finding, pinned: rs-matter emits the RCAC's random
+    /// serial number verbatim as a DER INTEGER, so roughly half of all draws are
+    /// negative integers that matter.js rejects with "Signature verification
+    /// failed" on `AddTrustedRootCertificate`. Without the redraw loop this fails
+    /// with probability `1 - 2^-32` — i.e. always, in practice.
+    #[test]
+    fn every_generated_rcac_serial_survives_a_strict_der_encoder() {
+        let crypto = default_crypto(rand::thread_rng(), DAC_PRIVKEY);
+        for _ in 0..32 {
+            let (_, rcac) = generate_usable_rcac(&crypto, 1).expect("a usable RCAC");
+            assert!(
+                serial_is_der_canonical(&rcac).unwrap(),
+                "generated RCAC serial is not DER-canonical: {rcac:02x?}"
+            );
+        }
+    }
+
+    /// The predicate itself, against the cases matter.js's `DerCodec` distinguishes
+    /// (`@matter/general/dist/esm/codec/DerCodec.js`, `#encodeInteger`: prepend a
+    /// zero byte, then strip leading zeros while the next byte is < 0x80).
+    #[test]
+    fn der_canonical_serials_are_exactly_the_minimal_positive_ones() {
+        // Wrap a serial in the minimum TLV a cert struct needs to be parsed.
+        fn cert_with_serial(serial: &[u8]) -> Vec<u8> {
+            let mut v = vec![0x15, 0x30, 0x01, serial.len() as u8];
+            v.extend_from_slice(serial);
+            v.push(0x18);
+            v
+        }
+        let cases: &[(&[u8], bool)] = &[
+            (&[0x7f], true),
+            (&[0x00], true),                                     // zero, not padded
+            (&[0x80], false),                                    // negative
+            (&[0xff], false),                                    // negative
+            (&[0x00, 0x80], true),                               // minimal sign pad
+            (&[0x00, 0x7f], false),                              // redundant pad
+            (&[0x5d, 0xde, 0xdd, 0x4c, 0xae, 0xe2, 0x48, 0x59], true),  // the serial that worked
+            (&[0xbf, 0xe6, 0x9e, 0xc7, 0x92, 0x06, 0x2c, 0x31], false), // the one matter.js rejected
+        ];
+        for (serial, expected) in cases {
+            let cert = cert_with_serial(serial);
+            assert_eq!(
+                serial_is_der_canonical(&cert).unwrap(),
+                *expected,
+                "for serial {serial:02x?}"
+            );
+        }
+        // An empty serial is not a valid INTEGER at all, and a cert without one
+        // must not read as "canonical" by omission.
+        assert!(!serial_is_der_canonical(&cert_with_serial(&[])).unwrap());
+        assert!(serial_is_der_canonical(&[0x15, 0x18]).is_err());
     }
 
     #[test]
