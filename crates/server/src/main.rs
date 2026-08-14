@@ -6,6 +6,7 @@ use clap::Parser;
 use matter_rs_controller::stack_api::{Stack, StackEvent};
 use matter_rs_controller::storage::{normalize_fabric_label, Storage};
 use matter_rs_server::{config::Config, http, logging};
+use socket2::{Domain, Protocol, Socket, Type};
 
 /// How long the Matter stack gets to establish (or load) the fabric identity
 /// before we give up. Generating a CA plus a NOC is fast; a slow or read-only
@@ -37,6 +38,33 @@ fn fatal(message: &str) -> ! {
     tracing::error!("{message}");
     eprintln!("fatal: {message}");
     std::process::exit(1);
+}
+
+/// Binds `[::]:<port>` (the implicit "no `--listen-address` given" address)
+/// with `IPV6_V6ONLY` explicitly cleared, so a lone dual-stack bind also
+/// answers IPv4 clients. Plain `TcpListener::bind` leaves that flag at the
+/// platform default, which is off (dual-stack) on Linux but on for some
+/// other hosts (e.g. some BSDs) — silently refusing every IPv4 connection there
+/// despite the operator asking to bind "all interfaces". Explicit
+/// `--listen-address` values skip this: a caller who named specific
+/// addresses gets exactly those sockets, not an implicit dual-stack
+/// widening of one of them.
+///
+/// Mirrors `matter-rs-stack::runtime::create_dual_stack_socket`'s dance for
+/// its UDP socket (same underlying reason, same `set_only_v6(false)`); this
+/// is the TCP analogue. `tokio::net::TcpListener::from_std` requires the
+/// socket already be non-blocking, hence `set_nonblocking(true)` last.
+fn bind_dual_stack(addr: &str) -> std::io::Result<tokio::net::TcpListener> {
+    let sock_addr: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{addr}: {e}")))?;
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(false)?;
+    socket.set_reuse_address(true)?;
+    socket.bind(&sock_addr.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    tokio::net::TcpListener::from_std(socket.into())
 }
 
 #[tokio::main]
@@ -156,7 +184,8 @@ async fn main() {
     let router = http::build_router(state);
 
     // Bind each --listen-address (or all interfaces when none given).
-    let addrs: Vec<String> = if config.listen_address.is_empty() {
+    let is_default_bind = config.listen_address.is_empty();
+    let addrs: Vec<String> = if is_default_bind {
         tracing::warn!("no --listen-address given; binding all interfaces");
         vec![format!("[::]:{}", config.port)]
     } else {
@@ -167,7 +196,14 @@ async fn main() {
 
     let mut servers = tokio::task::JoinSet::new();
     for addr in addrs {
-        let listener = match tokio::net::TcpListener::bind(&addr).await {
+        // Only the implicit "[::]" path needs the dual-stack socket option; an
+        // operator who named specific addresses gets exactly those sockets.
+        let bound = if is_default_bind {
+            bind_dual_stack(&addr)
+        } else {
+            tokio::net::TcpListener::bind(&addr).await
+        };
+        let listener = match bound {
             Ok(l) => l,
             Err(e) => {
                 // The stack thread is already up and holding the fabric; stop it

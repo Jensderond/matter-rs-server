@@ -201,8 +201,13 @@ pub(crate) mod test_rig {
     pub struct Rig {
         pub ctrl: Arc<MatterController>,
         pub stack: Arc<FakeStack>,
-        pub dir: tempfile::TempDir,
-        pub stack_tx: tokio::sync::mpsc::UnboundedSender<crate::stack_api::StackEvent>,
+        // Never read, but must outlive `ctrl`: dropping the `TempDir` deletes the
+        // storage dir out from under `Storage`, and dropping the sender would
+        // close `stack_rx` and end the controller's event-relay loop early.
+        // Underscore-prefixed (rather than `#[allow(dead_code)]`) so the compiler
+        // still catches an actual accidental read turning into a real bug.
+        pub _dir: tempfile::TempDir,
+        pub _stack_tx: tokio::sync::mpsc::UnboundedSender<crate::stack_api::StackEvent>,
     }
 
     pub fn rig_with_nodes(records: Vec<NodeRecord>) -> Rig {
@@ -215,7 +220,7 @@ pub(crate) mod test_rig {
             stack.clone(), storage, identity(), 1,
             "matter-rs-server/test (rs-matter/03bc8f2)".into(),
             false, Arc::new(NopLog), stack_rx);
-        Rig { ctrl, stack, dir, stack_tx }
+        Rig { ctrl, stack, _dir: dir, _stack_tx: stack_tx }
     }
 
     pub fn rig() -> Rig { rig_with_nodes(vec![]) }

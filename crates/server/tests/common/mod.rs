@@ -33,3 +33,31 @@ pub async fn spawn_server(
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     (addr, tx)
 }
+
+/// Like `spawn_server`, but on two independent listeners sharing one router —
+/// the test-side mirror of `main.rs`'s per-`--listen-address` `JoinSet` loop,
+/// so a caller can prove that loop's multi-listener path actually serves each
+/// socket it opens, not just the single-listener case every other test covers.
+///
+/// `mod common;` is re-compiled into every integration test binary that
+/// declares it, and only `ws_protocol.rs` currently calls this; `health.rs`'s
+/// copy of the module sees no caller at all, hence the `allow` — this is a
+/// shared-test-support artifact, not dead code in any real sense.
+#[allow(dead_code)]
+pub async fn spawn_server_multi(
+    controller: Arc<dyn Controller>,
+) -> (SocketAddr, SocketAddr, tokio::sync::watch::Sender<bool>) {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let state = matter_rs_server::http::AppState { controller, shutdown: rx };
+    let router = matter_rs_server::http::build_router(state);
+
+    let listener_a = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+
+    let router_a = router.clone();
+    tokio::spawn(async move { axum::serve(listener_a, router_a).await.unwrap() });
+    tokio::spawn(async move { axum::serve(listener_b, router).await.unwrap() });
+    (addr_a, addr_b, tx)
+}

@@ -23,8 +23,15 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
+# Matches `crates/stack`'s version/features exactly (that crate already pulls
+# it in for its dual-stack UDP socket, so this adds no new dependency to the
+# graph) — used here for the analogous dual-stack TCP bind in `main.rs`.
+socket2 = { version = "0.5", features = ["all"] }
 
 [dev-dependencies]
+# 0.24 here vs axum's 0.29 pulled in transitively: two versions of the same
+# crate in the graph, but this one is test-only (a WS client, not the server's
+# own implementation), so the duplication is accepted rather than chased.
 tokio-tungstenite = "0.24"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 tempfile = "3"

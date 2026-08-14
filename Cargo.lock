@@ -1428,6 +1428,7 @@ dependencies = [
  "matter-rs-wire",
  "reqwest",
  "serde_json",
+ "socket2 0.5.10",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.24.0",

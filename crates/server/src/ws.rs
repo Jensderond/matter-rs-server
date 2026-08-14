@@ -24,6 +24,7 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
 use axum::response::Response;
 use futures_util::SinkExt;
+use tokio::sync::broadcast::error::RecvError;
 
 use matter_rs_wire::envelope::{CommandMessage, ErrorResult, SuccessResult};
 use matter_rs_wire::error::ServerErrorCode;
@@ -86,7 +87,17 @@ async fn handle_connection(mut socket: WebSocket, state: AppState) {
                         if socket.send(Message::Text(frame.into())).await.is_err() { return; }
                     }
                     Ok(_) => {}                       // not listening: drop
-                    Err(_) => {}                      // lagged/closed: keep serving commands
+                    // The consumer (this connection) fell behind the broadcast buffer
+                    // and lost `n` events. That is a real gap in what the client sees,
+                    // so it earns a warning even though we keep serving — there is no
+                    // way to recover the lost events, only to flag that it happened.
+                    Err(RecvError::Lagged(n)) => {
+                        tracing::warn!("connection dropped {n} events (slow consumer)");
+                    }
+                    // The controller owns the sender for its lifetime (see
+                    // `subscribe_events`), so `Closed` only happens at shutdown, which
+                    // the watch-channel arm below already handles. Silent on purpose.
+                    Err(RecvError::Closed) => {}
                 }
             }
             res = shutdown.changed() => {

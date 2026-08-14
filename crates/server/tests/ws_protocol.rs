@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::Message;
 
 mod common;
-use common::{spawn_server, test_server_info};
+use common::{spawn_server, spawn_server_multi, test_server_info};
 
 async fn connect(addr: std::net::SocketAddr)
 -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
@@ -100,5 +100,40 @@ async fn shutdown_sends_server_shutdown_event_and_closes() {
             Some(Ok(Message::Close(_))) => break,
             Some(Ok(_)) => continue,
         }
+    }
+}
+
+#[tokio::test]
+async fn shutdown_reaches_a_connection_that_never_started_listening() {
+    // ws.rs's docstring promises the shutdown frame "regardless of listening
+    // state" — this connection never sends start_listening at all, so it
+    // pins that the shutdown arm isn't accidentally gated on `listening`.
+    let stub = Arc::new(StubController::new(test_server_info()));
+    let (addr, shutdown) = spawn_server(stub).await;
+    let mut ws = connect(addr).await;
+    let _hello = next_json(&mut ws).await;
+
+    shutdown.send(true).unwrap();
+    let ev = next_json(&mut ws).await;
+    assert_eq!(ev["event"], "server_shutdown");
+    loop {
+        match ws.next().await {
+            None | Some(Err(_)) => break,
+            Some(Ok(Message::Close(_))) => break,
+            Some(Ok(_)) => continue,
+        }
+    }
+}
+
+#[tokio::test]
+async fn two_listen_addresses_both_serve_health() {
+    // Mirrors main.rs's per-`--listen-address` JoinSet loop: one router, two
+    // independent listeners. Proves the multi-address path actually serves
+    // both sockets, not just whichever one happens to be bound first.
+    let stub = Arc::new(StubController::new(test_server_info()));
+    let (addr_a, addr_b, _shutdown) = spawn_server_multi(stub).await;
+    for addr in [addr_a, addr_b] {
+        let body: Value = reqwest::get(format!("http://{addr}/health")).await.unwrap().json().await.unwrap();
+        assert_eq!(body["node_count"], 0);
     }
 }
