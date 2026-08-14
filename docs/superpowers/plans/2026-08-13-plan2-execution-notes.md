@@ -9,8 +9,13 @@ was implemented and reviewed by the controller directly rather than by subagents
 Task 19 was the plan's acceptance gate and it passed against the virtual matter.js
 device — see "Task 19 as executed". **Task 20 (whole-branch review) has now RUN,
 its verdict was "ready to merge with fixes", and its one fix wave is applied** —
-see "Task 20: whole-branch review and its fix wave" below. A scoped re-review of
-that wave is the remaining step.
+see "Task 20: whole-branch review and its fix wave" below. **The scoped re-review
+of that wave came back clean — all findings addressed, no new breakage, no open
+items — and the live e2e was re-run at the wave's tip and passed every leg. All 20
+tasks are done.** The only remaining step is Jens's own: merging
+`plan2-rs-matter-core` to `master` and pushing, which execution deliberately did
+not do (a shared-branch side effect is his call). Read "Still open, for Jens"
+under Task 20 first — it lists what was deliberately left, in priority order.
 
 Moved machines twice at Jens's direction: tasks 1–11 on the first, 12–16 on
 CT 110, and now again because rs-matter rebuilds were too slow there. The SDD
@@ -106,9 +111,10 @@ failure stops the already-running stack thread before exiting.
 
 The whole-branch review ran at `5a6923b` and found what the per-task reviews
 structurally could not: the *interaction* between decisions made in different
-tasks. **Verdict: ready to merge with fixes. No Critical findings.** Its triage
-list lives in the (ephemeral) SDD ledger; everything it ruled in is applied in one
-fix wave, `9726cc9` / `d75a380` / `e84dea3` plus this docs commit:
+tasks. **Verdict: ready to merge with fixes. No Critical findings.** Everything it ruled
+in is applied in one fix wave, `9726cc9` / `d75a380` / `e84dea3` plus this docs
+commit (the triage outcome is transcribed under "Triage outcome" below, so it does
+not die with the ephemeral SDD ledger):
 
 - **`config.json` read-modify-write was unserialized and all writers shared one
   temp path** — the one genuine concurrency bug on the branch, and the reason
@@ -145,7 +151,85 @@ attribute reordering (JSON key order is not semantic), a `cargo fmt` sweep, and 
 
 `cargo test --workspace` at the end of the wave: **269 passing, 0 failed,
 1 ignored** (256 before it, plus 13 new tests). `cargo clippy --workspace
---all-targets` is back to exactly the known pre-existing set.
+--all-targets` is back to exactly the known pre-existing set, and
+`cargo build --release` is green at the wave's tip.
+
+### Triage outcome
+
+The whole-branch review triaged every deferred minor, parked finding and
+controller ruling accumulated across tasks 1–19. **Exactly one came back
+"must-fix-before-merge": Task 3's carry-forward check on config write paths,
+answered *no* and fixed above.** Everything else was ruled acceptable-as-known and
+stands as written in the sections below.
+
+Two of its triage notes are worth keeping because they change what a future reader
+should do:
+
+- **`fabric_id` stored-scalar-vs-derived-truth** — resolved by the warn (see the
+  struck entry below). The reviewer's suggestion is what unblocked a dilemma the
+  notes had carried for several tasks: `install` *errors* on a `controller_node_id`
+  mismatch, but a `fabric_id` mismatch is not fatal to CASE, so warning gets the
+  diagnostic without refusing to boot a working install and without colliding with
+  the "stored wins over CLI flags" warning.
+- **A compounding chain no per-task review could see:** no parent-dir fsync after
+  the atomic rename + the (now-fixed) unserialized config read-modify-write +
+  `load_config`'s lenient `unwrap_or_default()` together meant a low-probability
+  race could end in *silently defaulted configuration*. Each of the three is
+  individually defensible; the combination was the only silent-data-loss path on
+  the branch. Fixing the middle link broke the chain — but **the missing parent-dir
+  fsync and the lenient reader are both still there**, so do not re-introduce an
+  unserialized writer.
+
+### Post-fix-wave live e2e re-run — ALL LEGS PASS
+
+Re-run at the wave's tip because three of its commits touch the commissioning path
+and `server.json` gained a field. Fresh-storage leg: commission 2.295 s (2.24 s
+pre-wave, no regression), 121 attributes, `toggle` → `attribute_updated
+[1,"1/6/0",true]` 64 ms later, `read_attribute` agreeing. Restart leg: a *fresh
+process* on the same `--storage-path` loaded the identity (no "generating a
+fabric"), resumed CASE, reached `available: true` in 198 ms, and a new toggle on
+the restarted process produced its own event. The new `alloc_lock → config_write`
+order was exercised on a real commission with no stall, and `config.json` came out
+with `next_node_id: 2`.
+
+`server.json` round-tripped with `"version": 1`, and — the check that actually
+matters for the migration trap — **a copy with `version` stripped was booted by a
+real process: it loads, derives the same fabric, and warns about nothing.** That
+verifies the upgrade path an existing install takes, not merely the new-file path.
+
+Two non-defects from the re-run:
+
+- **A version-less `server.json` is never rewritten**, so it stays version-less
+  indefinitely. Harmless (the serde default covers it), but it means "written by
+  v1" and "predates the version field" are indistinguishable forever. If that
+  distinction ever matters, write the field on first successful load.
+- **The failure→code-8/4 mapping was never exercised live**, because every
+  commissioning succeeded. Unit-covered only.
+
+### Still open, for Jens — surfaced by the final re-review, deliberately not fixed
+
+There is one fix wave by process, so these are information, not omissions:
+
+- **`WifiCredential` derives `Debug` with a plaintext `password`, and `ConfigData`
+  contains it.** This is the *same* hazard the redacting `Debug` just closed for
+  `ServerIdentity`. Unreached in non-test code today (no `{cfg:?}`/`{config:?}`
+  anywhere outside tests) — but the fix wave's own new test prints it in an assert
+  message (`crates/controller/src/real.rs:478-479`). A redacting `Debug` on
+  `WifiCredential` is the same ~8 lines and closes the class rather than one
+  instance. **Recommended as the first follow-up.**
+- **`set_wifi`'s "omit the password to keep the existing one" read happens outside
+  `config_write`**, so two concurrent `set_wifi_credentials` on one id can carry a
+  stale password forward. Pre-existing shape, benign, not widened by the wave.
+- **Credential commands now commit to memory even when the disk write fails** (they
+  return code 0 and no `server_info_updated`). Deliberate: rolling memory back
+  would un-reserve the node id `allocate_node_id` just advanced, and a duplicate
+  node id is worse than a credential that does not survive a restart. Consequence
+  worth knowing: HA is told the write failed, but *this process run* will use the
+  credential.
+- **`open_commissioning_window`'s `timeout` and `ping_node`'s `attempts` still turn
+  a negative or fractional JSON number into the default** rather than an error
+  (`as_u64` → `None`), unlike the now-validated over-range case. Pre-existing
+  leniency, same class as the `epoch_s` fractional-number item below.
 
 ## Environment prerequisites
 
@@ -423,8 +507,14 @@ exclusions and gaps, NOT the plan's seven).
   identity always wins over the CLI flags" — the two horns of the old dilemma.
   Warn-and-boot is asserted by
   `a_stored_fabric_id_that_disagrees_with_the_rcac_warns_but_still_boots`.
-- Pre-existing clippy: `manual_is_multiple_of` (`storage.rs:221`),
-  `type_complexity` (`stack_api.rs:169`), 5 warnings in `gen`'s build script.
+- Pre-existing clippy, verified by *location* at the branch tip (8 sites):
+  `manual_is_multiple_of` (`controller/src/storage.rs:301` — was `:221`, the file
+  grew), `type_complexity` (`controller/src/stack_api.rs:169` and
+  `stack/src/runtime.rs:649`), and 5 in `gen`'s build script.
+  **Compare clippy by warning location, never by count** — clippy only re-emits
+  diagnostics for crates it actually recompiles, so counts differ run to run for
+  reasons that have nothing to do with the code. Touch the crate roots to force a
+  recheck before comparing.
 - The repo is not `cargo fmt`-clean by convention (hand-formatted ~100 cols across
   all crates). If a fmt gate is wanted, do it as one deliberate sweep, never
   smuggled into a feature task.
