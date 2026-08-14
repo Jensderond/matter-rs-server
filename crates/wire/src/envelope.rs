@@ -4,12 +4,26 @@ use serde_json::Value;
 use crate::error::ServerErrorCode;
 
 /// Inbound request: {"message_id", "command", "args"?}.
+///
+/// `args` may be absent OR literally `null`: python-matter-server's client
+/// dataclass serializes `args=None` as `"args": null` (Home Assistant sends
+/// exactly that for `start_listening`), and matterjs-server, being JS, never
+/// distinguished the two. Rejecting the null desyncs the client's sequential
+/// connect flow — it reads the error reply where the node dump should be and
+/// the whole integration goes down. Discovered live at cutover.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CommandMessage {
     pub message_id: String,
     pub command: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty_map")]
     pub args: serde_json::Map<String, Value>,
+}
+
+fn null_as_empty_map<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<serde_json::Map<String, Value>, D::Error> {
+    let v: Option<serde_json::Map<String, Value>> = Deserialize::deserialize(d)?;
+    Ok(v.unwrap_or_default())
 }
 
 /// Outbound success: {"message_id", "result"}.
@@ -56,6 +70,21 @@ mod tests {
 
         let m: CommandMessage =
             serde_json::from_str(r#"{"message_id":"2","command":"server_info"}"#).unwrap();
+        assert!(m.args.is_empty());
+    }
+
+    /// Home Assistant's client sends `"args": null` (dataclass `args=None`),
+    /// and matterjs-server accepted it — rejecting it took the whole Matter
+    /// integration down at cutover, because the client reads its connect
+    /// replies sequentially and choked on the error result.
+    #[test]
+    fn null_args_parse_as_empty_exactly_like_absent_args() {
+        let m: CommandMessage = serde_json::from_str(
+            r#"{"message_id":"3","command":"start_listening","args":null}"#,
+        )
+        .unwrap();
+        assert_eq!(m.message_id, "3");
+        assert_eq!(m.command, "start_listening");
         assert!(m.args.is_empty());
     }
 
