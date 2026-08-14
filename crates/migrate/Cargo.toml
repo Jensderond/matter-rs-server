@@ -1,0 +1,27 @@
+[package]
+name = "matter-rs-migrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "matter_rs_migrate"
+path = "src/lib.rs"
+
+[[bin]]
+name = "matter-rs-migrate"
+path = "src/main.rs"
+
+[dependencies]
+matter-rs-controller = { path = "../controller" }
+matter-rs-stack = { path = "../stack" }
+serde_json.workspace = true
+thiserror.workspace = true
+# gzip for snapshot.json.gz and *.jsonl.gz WAL segments (read), and for the
+# integration fixture generator (write).
+flate2 = "1"
+hex = "0.4"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"
