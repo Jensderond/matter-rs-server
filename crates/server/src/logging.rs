@@ -162,6 +162,10 @@ mod tests {
 
     #[test]
     fn set_console_level_is_reported_back_verbatim() {
+        // `set` reads the process environment via `EnvFilter::from_env_lossy`;
+        // `config`'s tests write it, so this must hold the crate-wide lock for
+        // as long as `set` might run — see `crate::test_env`.
+        let _env = crate::test_env::lock();
         let (c, _layer) = control("info", false);
         assert_eq!(c.get(), ("info".to_string(), None));
         c.set(Some("warning"), None);
@@ -179,6 +183,8 @@ mod tests {
 
     #[test]
     fn file_level_mirrors_the_console_level_only_when_a_log_file_exists() {
+        // See `set_console_level_is_reported_back_verbatim`: `set` reads env.
+        let _env = crate::test_env::lock();
         let (c, _layer) = control("info", true);
         assert_eq!(c.get(), ("info".to_string(), Some("info".to_string())));
         // Deviation #4: file_loglevel is not independently settable; the
@@ -199,6 +205,9 @@ mod tests {
     /// rather than claim a change it did not make.
     #[test]
     fn a_failed_reload_does_not_change_the_reported_level() {
+        // `set` builds its filter (reading env) before it ever attempts the
+        // reload that then fails, so this reads env too — same lock.
+        let _env = crate::test_env::lock();
         let (c, layer) = control("info", false);
         drop(layer);
         c.set(Some("debug"), None);

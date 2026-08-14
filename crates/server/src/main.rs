@@ -42,13 +42,13 @@ fn fatal(message: &str) -> ! {
 
 /// Binds `[::]:<port>` (the implicit "no `--listen-address` given" address)
 /// with `IPV6_V6ONLY` explicitly cleared, so a lone dual-stack bind also
-/// answers IPv4 clients. Plain `TcpListener::bind` leaves that flag at the
-/// platform default, which is off (dual-stack) on Linux but on for some
-/// other hosts (e.g. some BSDs) — silently refusing every IPv4 connection there
-/// despite the operator asking to bind "all interfaces". Explicit
-/// `--listen-address` values skip this: a caller who named specific
-/// addresses gets exactly those sockets, not an implicit dual-stack
-/// widening of one of them.
+/// answers IPv4 clients. Plain `TcpListener::bind` leaves that flag at
+/// whatever the platform defaults it to: off (dual-stack) on Linux and
+/// macOS, but on (v6-only) on some other hosts (some BSDs, and Windows) —
+/// which would silently refuse every IPv4 connection there despite the
+/// operator asking to bind "all interfaces". Explicit `--listen-address`
+/// values skip this: a caller who named specific addresses gets exactly
+/// those sockets, not an implicit dual-stack widening of one of them.
 ///
 /// Mirrors `matter-rs-stack::runtime::create_dual_stack_socket`'s dance for
 /// its UDP socket (same underlying reason, same `set_only_v6(false)`); this
@@ -62,7 +62,11 @@ fn bind_dual_stack(addr: &str) -> std::io::Result<tokio::net::TcpListener> {
     socket.set_only_v6(false)?;
     socket.set_reuse_address(true)?;
     socket.bind(&sock_addr.into())?;
-    socket.listen(1024)?;
+    // 128: the same backlog std's own `TcpListener::bind` asks for internally
+    // on every platform but the 3DS and Haiku. This is a control-plane
+    // listener (one connection per WS/HTTP client, not a high-fanout server),
+    // so there's no tuning case for deviating from that default.
+    socket.listen(128)?;
     socket.set_nonblocking(true)?;
     tokio::net::TcpListener::from_std(socket.into())
 }
@@ -270,5 +274,41 @@ async fn main() {
 
     if matches!(stop, StopReason::StackDied) {
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for `set_only_v6(false)` specifically: bind `[::]:0`
+    /// via `bind_dual_stack`, then connect to that same port over IPv4. A
+    /// v6-only socket would refuse (or hang on) that connect instead.
+    ///
+    /// Caveat: this only distinguishes the two outcomes on a host whose
+    /// platform default is v6-only (some BSDs, Windows) — Linux and macOS
+    /// already default new `[::]` binds to dual-stack, so on those platforms
+    /// this test would also pass with the `set_only_v6(false)` line deleted.
+    /// It still pins the function's actual contract (bind once, serve both
+    /// families), which is what regressions in the surrounding wiring — the
+    /// domain, the bind address, the non-blocking conversion — would break
+    /// on every platform, including this one.
+    #[tokio::test]
+    async fn dual_stack_bind_accepts_an_ipv4_connection() {
+        let listener = bind_dual_stack("[::]:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert!(addr.is_ipv6(), "expected an IPv6-family local_addr, got {addr}");
+
+        let accept = tokio::spawn(async move { listener.accept().await });
+        tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(("127.0.0.1", addr.port())))
+            .await
+            .expect("IPv4 connect to the dual-stack listener timed out")
+            .expect("IPv4 connect to the dual-stack listener should succeed");
+        accept.await.unwrap().expect("accept should succeed for the IPv4 connection");
+    }
+
+    #[test]
+    fn bind_dual_stack_rejects_an_unparseable_address() {
+        assert!(bind_dual_stack("not an address").is_err());
     }
 }

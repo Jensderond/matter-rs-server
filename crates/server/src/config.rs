@@ -105,16 +105,15 @@ mod tests {
         "BLE_PROXY",
     ];
 
-    /// Clears every `Config` env binding, then runs `f` while holding a lock
-    /// that serializes all callers. `std::env::remove_var`/`set_var` mutate a
-    /// single process-global table, and cargo runs `#[test]` fns as threads in
-    /// one process — without the lock, two of these tests running concurrently
-    /// could each clear the other's env vars mid-assertion.
+    /// Clears every `Config` env binding, then runs `f` while holding
+    /// `crate::test_env`'s crate-wide lock. That lock — not one local to this
+    /// module — is what actually closes the race: this crate's `--lib` test
+    /// binary also contains `logging`'s tests, some of which read the
+    /// environment via `EnvFilter::from_env_lossy`, and a module-local mutex
+    /// would do nothing to serialize against those. See `crate::test_env` for
+    /// the full rationale.
     fn with_clean_env<T>(f: impl FnOnce() -> T) -> T {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        // A poisoned lock (a prior test panicked while holding it) still leaves
-        // the env vars in a clearable state, so recovering the guard is fine.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env::lock();
         for key in CONFIG_ENV_VARS {
             std::env::remove_var(key);
         }
