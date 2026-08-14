@@ -49,7 +49,12 @@ written atomically (temp file + rename). Key material is `0600`.
     config.json      fabric_label, next_node_id, wifi_credentials, thread_datasets
     nodes/<id>.json  one file per commissioned node: dates, device fabric index,
                      addresses, and the last full attribute snapshot
-    sessions/        rs-matter's CASE session-resumption records
+    sessions/        rs-matter's DirKvBlobStore: fabric blob + CASE resumption records
+
+`sessions/` being a **directory** is a deliberate deviation from the design spec's
+single `sessions.json` — rs-matter's `DirKvBlobStore` owns that tree and we hand it
+the path rather than reimplementing its layout. Same best-effort intent: losing it
+costs one CASE handshake per node, nothing more.
 
 `server.json` is the fabric. Lose it and every commissioned node is orphaned —
 they will still hold a fabric entry pointing at a CA that no longer exists, and
@@ -75,6 +80,13 @@ TLV to DER — matter.js does — hashes differently and rejects with "Signature
 verification failed". Dropping the ICAC halves the exposure; the server also
 redraws the RCAC until its serial is DER-canonical, which removes it. See the
 amendment on spike finding 1 and `crates/stack/src/identity.rs`.
+
+The redraw only protects fabrics minted after it existed. A `server.json` written
+earlier has a 50% chance of holding a non-canonical RCAC, and it is never reminted
+(that would discard the CA key every commissioned node trusts), so startup logs a
+warning naming the symptom instead. If you see it, the only fix is to delete
+`server.json` and re-commission every node — a deliberate, destructive operator
+decision.
 
 ## Deployment notes
 
@@ -144,10 +156,41 @@ narrow the WS bind only; they do not affect the Matter transport.
   via mDNS".** rs-matter converts a bare non-success `StatusResponse` to
   `ErrorCode::NotFound` before our code sees the chunk, and our mapping turns that
   into the wire code `NodeNotResolving`. The command did reach the node.
-- **No BLE commissioning, no OTA provider, no dashboard, no device attestation
-  against the real PAA store** (`allow_test_attestation` is on — rs-matter has no
-  PAA-chain verification path yet). `ping_node` pings sequentially. These are the
-  plan's accepted v1 deviations.
+- **`sessions/` is a directory, not the spec's `sessions.json`.** rs-matter's
+  `DirKvBlobStore` owns that tree (fabric blob + CASE resumption records); same
+  best-effort intent as the spec, different shape on disk.
+- **Out of scope in v1, not deviations:** no BLE commissioning, no OTA provider, no
+  dashboard, no DCL. Device attestation runs with `allow_test_attestation` because
+  rs-matter has no PAA-chain verification path yet, so a device presenting a test
+  DAC is accepted. `ping_node` pings a node's addresses sequentially rather than
+  concurrently.
+
+### Accepted parity gaps vs the Node server
+
+The plan fixes these seven deliberately (its "known, accepted v1 deviations"),
+recorded here **so nobody "fixes" them silently.** Plan 3's fixtures are where the
+ones that need tightening get tightened.
+
+1. **`read_attribute` issues one IM read for all paths**, letting rs-matter chunk
+   the response, instead of Node's 9-paths-per-request batching.
+2. **Epoch conversion is top-level only.** A `epoch-us`/`epoch-s` attribute whose
+   type `gen` knows is converted; the same field nested inside a struct `gen` does
+   not know passes through as a raw number.
+3. **`node_updated` fires on priming, interview and availability changes**, not on
+   Node's 6-second basic-information debounce — so a client can see more of them,
+   and sooner, than the Node server would send.
+4. **`set_loglevel` drives one global filter.** `file_loglevel` mirrors
+   `console_loglevel` when `--log-file` is set and is `null` otherwise; there is no
+   independent per-sink level.
+5. **`discover` / `discover_commissionable_nodes` return instance name + address
+   only.** rs-matter's browse does not expose the mDNS TXT metadata, so every other
+   field carries Node's own default (`host_name: "000000000000"`,
+   `vendor_id: -1`, `product_id: -1`, …) rather than the device's real value.
+6. **No backpressure send-classes.** Node's reliable/ordered/coalescable event
+   classes stay deferred; the WS API fans out over one broadcast channel, so a slow
+   client drops events (with a warning) instead of being throttled.
+7. **`get_vendor_names` is the static CSA table only** — 1245 entries compiled in,
+   no DCL lookup, so a vendor id newer than the table has no name.
 
 ## Test
 
