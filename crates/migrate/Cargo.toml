@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 matter-rs-controller = { path = "../controller" }
 matter-rs-stack = { path = "../stack" }
+serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
 # gzip for snapshot.json.gz and *.jsonl.gz WAL segments (read), and for the
