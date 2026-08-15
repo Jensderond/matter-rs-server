@@ -1,0 +1,44 @@
+[
+  {
+    "name": "0/52/0 regression: invalid UTF-8 thread name decodes lossily",
+    "why": "node 12 live skip; ThreadMetricsStruct.name is char_string<8> (IDL:2119); Node decodes lossily",
+    "cluster": 52, "attr": 0,
+    "tlv": "16 15 24 00 2a 2c 01 01 ff 18 18",
+    "expect": [{"0": 42, "1": "�"}]
+  },
+  {
+    "name": "56/5 nested epoch: TimeZoneStruct.validAt shifts to Unix micros",
+    "why": "Converters.ts EpochUS at any depth (lines 394-398); Matter 0 == Unix 946684800s",
+    "cluster": 56, "attr": 5,
+    "tlv": "16 15 21 00 10 0e 24 01 00 2c 02 03 43 45 54 18 18",
+    "expect": [{"0": 3600, "1": 946684800000000, "2": "CET"}]
+  },
+  {
+    "name": "56/0 top-level epoch_us",
+    "why": "pre-existing behaviour, must survive the typed-walk rewrite",
+    "cluster": 56, "attr": 0,
+    "tlv": "04 00",
+    "expect": 946684800000000
+  },
+  {
+    "name": "octet string emits base64",
+    "why": "Converters.ts ConvKind.Bytes -> Bytes.toBase64 (line 403); WiFiNetworkDiagnostics.bssid is octet_string<6> (IDL:2365)",
+    "cluster": 54, "attr": 0,
+    "tlv": "10 04 de ad be ef",
+    "expect": "3q2+7w=="
+  },
+  {
+    "name": "null attribute stays null",
+    "why": "convertMatterToWebSocket returns null unchanged (line 372); bssid is nullable (IDL:2365)",
+    "cluster": 54, "attr": 0,
+    "tlv": "14",
+    "expect": null
+  },
+  {
+    "name": "unknown cluster falls back to untyped conversion",
+    "why": "Node: model undefined -> simple conversions only (lines 375-388); 64512 is unassigned in the vendored IDL",
+    "cluster": 64512, "attr": 0,
+    "tlv": "04 2a",
+    "expect": 42
+  }
+]
