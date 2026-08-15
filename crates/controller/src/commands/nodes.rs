@@ -15,11 +15,11 @@ use crate::storage::format_node_date;
 const MAX_PING_ATTEMPTS: u64 = 10;
 
 /// Clamped, not validated: `attempts` becomes `ping -c <attempts>` with a 1s
-/// interval, and `futures_join_all` walks the addresses sequentially, so an
-/// unclamped `attempts: 1000` would occupy a command handler for ~1000s *per
-/// address*. Nothing legitimate asks for more than a handful, and silently
-/// capping beats failing a request that is merely over-eager. A value that is
-/// not a u64 at all is a different matter: that is an error, not over-eagerness.
+/// interval, and addresses ping in parallel via `join_all_concurrent`, so the
+/// clamp bounds the per-address ping duration (~attempts × 1s + 10s timeout).
+/// Nothing legitimate asks for more than a handful, and silently capping beats
+/// failing a request that is merely over-eager. A value that is not a u64 at
+/// all is a different matter: that is an error, not over-eagerness.
 fn ping_attempts(args: &Map<String, Value>) -> Result<u64, CommandError> {
     Ok(opt_u64_strict(args, "attempts")?.unwrap_or(1).clamp(1, MAX_PING_ATTEMPTS))
 }
@@ -97,16 +97,25 @@ pub async fn ping_node(c: &MatterController, args: &Map<String, Value>) -> Resul
     let addrs = merged_addresses(c, node_id).await;
     let mut results = Map::new();
     let futures: Vec<_> = addrs.iter().map(|a| ping_one(a.clone(), attempts)).collect();
-    for (addr, ok) in futures_join_all(futures).await {
+    for (addr, ok) in join_all_concurrent(futures).await {
         results.insert(addr, Value::Bool(ok));
     }
     Ok(Value::Object(results))
 }
 
-// Small local join_all to avoid a futures dependency.
-async fn futures_join_all<T>(futs: Vec<impl std::future::Future<Output = T>>) -> Vec<T> {
-    let mut out = Vec::with_capacity(futs.len());
-    for f in futs { out.push(f.await); } // sequential is fine at homelab scale
+/// Concurrent join preserving input order — Node pings every address in
+/// parallel (`ControllerCommandHandler.ts:1410-1419`), and `attempts * 10s`
+/// per address is too slow to serialize. Spawned tasks rather than a `futures`
+/// dependency; a panicked ping task poisons only its own slot's `expect`,
+/// which matches the old behaviour of a panic in a sequential await.
+async fn join_all_concurrent<T: Send + 'static>(
+    futs: Vec<impl std::future::Future<Output = T> + Send + 'static>,
+) -> Vec<T> {
+    let handles: Vec<_> = futs.into_iter().map(tokio::spawn).collect();
+    let mut out = Vec::with_capacity(handles.len());
+    for h in handles {
+        out.push(h.await.expect("ping task panicked"));
+    }
     out
 }
 
@@ -141,7 +150,7 @@ pub async fn get_node_ip_addresses(c: &MatterController, args: &Map<String, Valu
 
 #[cfg(test)]
 mod tests {
-    use super::{ping_attempts, MAX_PING_ATTEMPTS};
+    use super::{ping_attempts, join_all_concurrent, MAX_PING_ATTEMPTS};
     use serde_json::json;
 
     /// The clamp itself, since exercising it through `ping_node` would mean
@@ -169,5 +178,28 @@ mod tests {
             );
         }
         assert_eq!(ping_attempts(&args(json!({"attempts": null}))).unwrap(), 1);
+    }
+
+    /// Node pings every address in parallel (ControllerCommandHandler.ts:1410-1419,
+    /// Promise.all); sequential was a plan-2 shortcut with a worst case of
+    /// attempts x 10s x N_addresses. Two 300ms sleeps finishing well under
+    /// 600ms proves concurrency; exact timing is deliberately slack.
+    #[tokio::test]
+    async fn pings_run_concurrently_and_keep_input_order() {
+        let start = std::time::Instant::now();
+        let out = join_all_concurrent(vec![
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                1u8
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = u8> + Send>>,
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                2u8
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = u8> + Send>>,
+        ])
+        .await;
+        assert_eq!(out, vec![1, 2], "input order, not completion order");
+        assert!(start.elapsed() < std::time::Duration::from_millis(550),
+                "concurrent would be ~300ms; sequential would be >=600ms");
     }
 }

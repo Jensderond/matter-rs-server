@@ -229,8 +229,7 @@ narrow the WS bind only; they do not affect the Matter transport.
 - **Out of scope in v1, not deviations:** no BLE commissioning, no OTA provider, no
   dashboard, no DCL. Device attestation runs with `allow_test_attestation` because
   rs-matter has no PAA-chain verification path yet, so a device presenting a test
-  DAC is accepted. `ping_node` pings a node's addresses sequentially rather than
-  concurrently.
+  DAC is accepted.
 
 ### Accepted parity gaps vs the Node server
 
