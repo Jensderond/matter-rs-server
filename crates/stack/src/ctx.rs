@@ -61,6 +61,10 @@ pub(crate) struct StackCtx<C: Crypto> {
     /// seen yet", which is *not* the same as `Some(0)`: event number 0 is a
     /// legal first event and must not be mistaken for the initial state.
     pub last_event: RefCell<HashMap<u64, u64>>,
+    /// node_id -> subscription report still awaiting its final ReportData
+    /// message (see `reports::PendingReports`). Subscription-lifetime, like
+    /// `subs`: cleared on resubscribe and on node removal.
+    pub pending_reports: RefCell<crate::reports::PendingReports>,
     /// node_id -> last known addresses ("ip" strings, most recent first)
     pub addrs: RefCell<HashMap<u64, Vec<String>>>,
     /// node_id -> supervisor task (dropping cancels).
@@ -68,13 +72,14 @@ pub(crate) struct StackCtx<C: Crypto> {
     /// **Cleanup contract for `stop_supervisor`.** Dropping the task
     /// releases the two *subscription-lifetime* maps by itself — the supervisor
     /// holds a guard over `subs` and `liveness` (`supervisor::SubscriptionGuard`),
-    /// so cancelling it mid-await cannot leak either. The two *node-lifetime*
-    /// caches are not covered and must be cleared by whoever removes the entry
-    /// here:
+    /// so cancelling it mid-await cannot leak either. The remaining caches are
+    /// not covered and must be cleared by whoever removes the entry here:
     ///
     /// - `last_event`, or a node re-commissioned under the same id inherits the
     ///   old high-water mark and drops its first events;
-    /// - `addrs`, or `node_addresses` keeps answering for a node that is gone.
+    /// - `addrs`, or `node_addresses` keeps answering for a node that is gone;
+    /// - `pending_reports`, or a report the old subscription left half-sent
+    ///   sits forever, waiting for a final message that will never arrive.
     pub supervisors: RefCell<HashMap<u64, async_executor::Task<()>>>,
 }
 
@@ -95,6 +100,7 @@ impl<C: Crypto> StackCtx<C> {
             subs: RefCell::new(HashMap::new()),
             liveness: RefCell::new(HashMap::new()),
             last_event: RefCell::new(HashMap::new()),
+            pending_reports: RefCell::new(Default::default()),
             addrs: RefCell::new(HashMap::new()),
             supervisors: RefCell::new(HashMap::new()),
         }

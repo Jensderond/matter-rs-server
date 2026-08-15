@@ -76,7 +76,6 @@ pub(crate) struct AttrAccumulator {
     out: Vec<(String, Value)>,
     index: HashMap<String, usize>,
     orphan_appends: Vec<String>,
-    saw_list_chunks: bool,
     failures: usize,
 }
 
@@ -132,14 +131,8 @@ impl AttrAccumulator {
             let key = format!("{e}/{cl}/{a}");
             match list_op(&data.path) {
                 ListOp::Replace => self.put(key, json),
-                ListOp::Append => {
-                    self.saw_list_chunks = true;
-                    self.append(key, json, who);
-                }
-                ListOp::SetIndex(i) => {
-                    self.saw_list_chunks = true;
-                    self.set_index(key, i, json, who);
-                }
+                ListOp::Append => self.append(key, json, who),
+                ListOp::SetIndex(i) => self.set_index(key, i, json, who),
             }
         }
     }
@@ -169,11 +162,12 @@ impl AttrAccumulator {
     /// append order, full stop.
     fn append(&mut self, key: String, json: Value, who: &str) {
         let Some(&at) = self.index.get(&key) else {
-            // No array to append to. Either the report is malformed, or — the
-            // real case — this is a subscription report whose list started in a
-            // previous `ReportData` *message*, which arrives as a separate
-            // `handle_report` call. Cross-message merging is not implemented, so
-            // say so loudly instead of handing the client a truncated array.
+            // No array to append to — the opening no-`ListIndex` report for this
+            // path was never absorbed. `ReportSink` no longer produces this by
+            // spanning messages (see `PendingReports`, which carries one
+            // accumulator across a whole multi-message report); what remains
+            // reachable here is a genuinely malformed report. Say so loudly
+            // instead of handing the client a truncated array.
             tracing::warn!(
                 "{who}: list append for {key} has no array to append to; the list is split \
                  across ReportData messages and is reported incomplete"
@@ -250,14 +244,54 @@ impl AttrAccumulator {
         &self.orphan_appends
     }
 
-    /// Whether any report in this batch was part of a chunked list.
-    pub fn saw_list_chunks(&self) -> bool {
-        self.saw_list_chunks
-    }
-
     /// Reports logged and skipped rather than returned.
     pub fn failures(&self) -> usize {
         self.failures
+    }
+}
+
+/// Accumulators-in-progress for multi-message subscription reports, keyed by
+/// node id.
+///
+/// `ReportSink::handle_report` is called once per `ReportData` *message*, but a
+/// report (and a chunked list inside it) can span several messages, signalled
+/// by `MoreChunkedMsgs`. The read/priming paths hold one accumulator across
+/// their whole exchange and merge naturally; the sink holds it here instead,
+/// releasing the merged changes only on the final message so the WS client
+/// sees one complete `attribute_updated` batch.
+///
+/// Keyed by node id alone: the supervisor maintains exactly one subscription
+/// per node, and messages of one report arrive in order on one exchange, so
+/// there is nothing finer to key on. An entry whose final message never
+/// arrives (device died mid-report) is dropped by [`Self::forget`], called on
+/// resubscribe (`supervisor::establish`) and node removal (`runtime::forget_node`).
+#[derive(Default)]
+pub(crate) struct PendingReports(HashMap<u64, AttrAccumulator>);
+
+impl PendingReports {
+    /// Absorb one message. `Some(changes)` when this message completes the
+    /// report; `None` while more messages are pending.
+    pub fn absorb_message(
+        &mut self,
+        node_id: u64,
+        report: &ReportDataResp<'_>,
+        who: &str,
+    ) -> Option<Vec<(String, Value)>> {
+        let mut acc = self.0.remove(&node_id).unwrap_or_default();
+        acc.absorb(report, who);
+        if report.more_chunks == Some(true) {
+            self.0.insert(node_id, acc);
+            return None;
+        }
+        if acc.failures() > 0 {
+            tracing::warn!("{who}: {} attribute report(s) skipped", acc.failures());
+        }
+        Some(acc.into_pairs())
+    }
+
+    /// Drop half-done state for a node — resubscribe or removal makes it stale.
+    pub fn forget(&mut self, node_id: u64) {
+        self.0.remove(&node_id);
     }
 }
 
@@ -341,18 +375,13 @@ impl<C: Crypto> ReportDataHandler for ReportSink<C> {
         ctx.liveness.borrow_mut().insert(node_id, embassy_time::Instant::now());
 
         let who = format!("node {node_id}");
-        let mut acc = AttrAccumulator::default();
-        acc.absorb(report, &who);
-        if acc.saw_list_chunks() && report.more_chunks == Some(true) {
-            tracing::warn!(
-                "{who}: chunked list continues in a following ReportData message; the merged \
-                 value may be incomplete"
-            );
-        }
-        let changes = acc.into_pairs();
-        if !changes.is_empty() {
-            // A closed receiver means the controller is shutting down.
-            let _ = ctx.events.send(StackEvent::AttributesChanged { node_id, changes });
+        // Borrow is dropped before the send; never held across an await.
+        let changes = ctx.pending_reports.borrow_mut().absorb_message(node_id, report, &who);
+        if let Some(changes) = changes {
+            if !changes.is_empty() {
+                // A closed receiver means the controller is shutting down.
+                let _ = ctx.events.send(StackEvent::AttributesChanged { node_id, changes });
+            }
         }
 
         walk_events(report, &who, |data| {
@@ -583,7 +612,6 @@ mod tests {
         );
 
         let acc = absorb(&bytes);
-        assert!(acc.saw_list_chunks());
         assert!(acc.orphan_appends().is_empty());
         assert_eq!(acc.into_pairs(), vec![("0/29/3".to_string(), json!([11, 22, 33]))]);
     }
@@ -592,8 +620,9 @@ mod tests {
     /// (`ops::interact::read_attributes`) both share one accumulator across
     /// every chunk of a *whole* exchange, not just one `ReportData` message —
     /// so a list opened in message 1 and appended to in message 2 must still
-    /// merge into one array, unlike `ReportSink`'s per-message accumulator
-    /// (documented at [`AttrAccumulator::append`]).
+    /// merge into one array. `ReportSink` gets the same guarantee via
+    /// `PendingReports`, pinned separately by
+    /// `a_subscription_list_split_across_messages_merges_before_release`.
     #[test]
     fn a_list_opened_in_one_message_and_appended_to_in_the_next_still_merges() {
         let empty = build(|w| {
@@ -629,6 +658,91 @@ mod tests {
         }
         let expected: Vec<Value> = (0..16).map(Value::from).collect();
         assert_eq!(acc.into_pairs(), vec![("0/29/1".to_string(), Value::Array(expected))]);
+    }
+
+    /// The ReportSink used to build one accumulator per ReportData *message*, so a
+    /// chunked list spanning messages of one subscription report lost its earlier
+    /// elements (the append warned "reported incomplete"). PendingReports carries
+    /// the accumulator across messages, keyed by node, and only releases the
+    /// changes when more_chunks stops.
+    #[test]
+    fn a_subscription_list_split_across_messages_merges_before_release() {
+        let empty = build(|w| {
+            w.start_array(&TLVTag::Anonymous).unwrap();
+            w.end_container().unwrap();
+        });
+        let e0 = build(|w| w.u16(&TLVTag::Anonymous, 11).unwrap());
+        let e1 = build(|w| w.u16(&TLVTag::Anonymous, 22).unwrap());
+
+        let msg1 = report_bytes(
+            &[
+                AttrResp::Data(AttrData::new(None, path(0, 29, 3, None), TLVElement::new(&empty))),
+                AttrResp::Data(AttrData::new(None, path(0, 29, 3, Some(None)), TLVElement::new(&e0))),
+            ],
+            true, // MoreChunkedMsgs
+        );
+        let msg2 = report_bytes(
+            &[AttrResp::Data(AttrData::new(None, path(0, 29, 3, Some(None)), TLVElement::new(&e1)))],
+            false,
+        );
+
+        let mut pending = PendingReports::default();
+
+        let elem = TLVElement::new(&msg1);
+        let report1 = ReportDataResp::from_tlv(&elem).unwrap();
+        assert_eq!(pending.absorb_message(9, &report1, "test"), None, "held until final message");
+
+        let elem = TLVElement::new(&msg2);
+        let report2 = ReportDataResp::from_tlv(&elem).unwrap();
+        let changes = pending.absorb_message(9, &report2, "test").expect("final message releases");
+        assert_eq!(changes, vec![("0/29/3".to_string(), json!([11, 22]))]);
+
+        // Nothing left behind for the node.
+        let elem = TLVElement::new(&msg2);
+        let report2 = ReportDataResp::from_tlv(&elem).unwrap();
+        assert_eq!(
+            pending.absorb_message(9, &report2, "test"),
+            Some(vec![("0/29/3".to_string(), json!([22]))]),
+            "a later report starts from a clean accumulator (this one is a lone orphan append)"
+        );
+    }
+
+    /// Interleaving: two nodes mid-report must not share an accumulator.
+    #[test]
+    fn pending_reports_are_per_node() {
+        let a = build(|w| w.u16(&TLVTag::Anonymous, 1).unwrap());
+        let msg_more = report_bytes(
+            &[AttrResp::Data(AttrData::new(None, path(1, 6, 0, None), TLVElement::new(&a)))],
+            true,
+        );
+        let msg_final = report_bytes(
+            &[AttrResp::Data(AttrData::new(None, path(1, 6, 1, None), TLVElement::new(&a)))],
+            false,
+        );
+
+        let mut pending = PendingReports::default();
+        let elem = TLVElement::new(&msg_more);
+        let r = ReportDataResp::from_tlv(&elem).unwrap();
+        assert_eq!(pending.absorb_message(1, &r, "test"), None);
+
+        // Node 2 completes in one message; node 1's pending state is untouched.
+        let elem = TLVElement::new(&msg_final);
+        let r = ReportDataResp::from_tlv(&elem).unwrap();
+        assert_eq!(pending.absorb_message(2, &r, "test"), Some(vec![("1/6/1".to_string(), json!(1))]));
+
+        let elem = TLVElement::new(&msg_final);
+        let r = ReportDataResp::from_tlv(&elem).unwrap();
+        let merged = pending.absorb_message(1, &r, "test").unwrap();
+        assert_eq!(merged, vec![("1/6/0".to_string(), json!(1)), ("1/6/1".to_string(), json!(1))]);
+
+        // forget() drops half-done state (resubscribe / node removal).
+        let elem = TLVElement::new(&msg_more);
+        let r = ReportDataResp::from_tlv(&elem).unwrap();
+        assert_eq!(pending.absorb_message(1, &r, "test"), None);
+        pending.forget(1);
+        let elem = TLVElement::new(&msg_final);
+        let r = ReportDataResp::from_tlv(&elem).unwrap();
+        assert_eq!(pending.absorb_message(1, &r, "test"), Some(vec![("1/6/1".to_string(), json!(1))]));
     }
 
     #[test]

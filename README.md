@@ -220,10 +220,6 @@ narrow the WS bind only; they do not affect the Matter transport.
 - **`node_addresses` is empty for nodes this process run did not commission**
   until their first CASE session refreshes it, so `get_node_ip_addresses` and
   `ping_node` answer from the stored record alone right after a restart.
-- **Lists split across `ReportData` *messages* are not merged.** Within one
-  message chunked lists merge correctly; a long list (a bridge's `PartsList`) split
-  across messages of a subscription report is reported incomplete, with a runtime
-  warning.
 - **Shutdown drops in-flight work.** A commissioning attempt in progress is
   abandoned, and up to 500 ms of CASE resumption records are lost (cost: one
   handshake).

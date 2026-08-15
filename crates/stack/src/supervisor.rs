@@ -136,6 +136,8 @@ async fn establish<C: Crypto>(
 ) -> Result<SubscribeEstablished, StackError> {
     // Before the subscribe, so the priming events below re-seed a clean mark.
     ctx.reset_event_high_water(node_id);
+    // A resubscribe orphans any report the old subscription left half-sent.
+    ctx.pending_reports.borrow_mut().forget(node_id);
 
     // All-`None` paths: every attribute and every event on every endpoint, which
     // is the single subscription matter.js maintains per node.

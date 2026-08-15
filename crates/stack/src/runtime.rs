@@ -53,7 +53,7 @@ use static_cell::StaticCell;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::ctx::StackCtx;
-use crate::reports::ReportSink;
+use crate::reports::{PendingReports, ReportSink};
 use crate::{identity, mdns, ops, supervisor, ReadyInfo, StackConfig};
 
 /// The reply half of a request. A dropped sender means the caller gave up (its
@@ -427,12 +427,13 @@ async fn request_loop<'a, C>(
                 drop(task);
 
                 // `subs` and `liveness` are the guard's to release (it runs when
-                // the executor drops the cancelled future). The node-lifetime
+                // the executor drops the cancelled future). The remaining
                 // caches are ours — see the cleanup contract on
                 // `StackCtx::supervisors`.
                 forget_node(
                     &mut ctx.last_event.borrow_mut(),
                     &mut ctx.addrs.borrow_mut(),
+                    &mut ctx.pending_reports.borrow_mut(),
                     node_id,
                 );
             }
@@ -488,12 +489,13 @@ async fn watch_supervisor<C: Crypto>(ctx: Rc<StackCtx<C>>, node_id: u64) {
 /// supervisor task is dropped. Clearing them here would be at best redundant and
 /// at worst a race with a supervisor that is being replaced.
 ///
-/// Takes the maps rather than a `StackCtx` so it is testable — a `StackCtx` needs
-/// a `&'static Matter` — the same shape as `ctx::note_event` and
+/// Takes the caches rather than a `StackCtx` so it is testable — a `StackCtx`
+/// needs a `&'static Matter` — the same shape as `ctx::note_event` and
 /// `supervisor::disown`.
 fn forget_node(
     last_event: &mut HashMap<u64, u64>,
     addrs: &mut HashMap<u64, Vec<String>>,
+    pending: &mut PendingReports,
     node_id: u64,
 ) {
     // Or a node re-commissioned under the same id inherits the old high-water
@@ -501,6 +503,8 @@ fn forget_node(
     last_event.remove(&node_id);
     // Or `node_addresses` keeps answering for a node that is gone.
     addrs.remove(&node_id);
+    // Or a report the old subscription left half-sent sits forever.
+    pending.forget(node_id);
 }
 
 /// Run one request and answer its `reply`.
@@ -609,6 +613,21 @@ fn create_dual_stack_socket() -> Result<async_io::Async<UdpSocket>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rs_matter::im::ReportDataResp;
+
+    /// A minimal `ReportDataResp` with no attribute/event reports — enough to
+    /// drive `PendingReports::absorb_message` without needing real wire bytes
+    /// (every field here is `pub`, so a struct literal is fine for a test).
+    fn bare_report(more_chunks: Option<bool>) -> ReportDataResp<'static> {
+        ReportDataResp {
+            subscription_id: None,
+            attr_reports: None,
+            event_reports: None,
+            more_chunks,
+            suppress_response: None,
+            interaction_model_revision: None,
+        }
+    }
 
     #[test]
     fn stopping_a_supervisor_drops_the_node_lifetime_caches() {
@@ -617,26 +636,37 @@ mod tests {
             (1u64, vec!["192.168.1.10".to_string()]),
             (2, vec!["192.168.1.11".to_string()]),
         ]);
+        let mut pending = PendingReports::default();
+        // Both nodes mid-report: a message with more_chunks still pending.
+        assert_eq!(pending.absorb_message(1, &bare_report(Some(true)), "test"), None);
+        assert_eq!(pending.absorb_message(2, &bare_report(Some(true)), "test"), None);
 
-        forget_node(&mut last_event, &mut addrs, 1);
+        forget_node(&mut last_event, &mut addrs, &mut pending, 1);
 
         // Or the same node id, re-commissioned, would inherit node 1's event
         // high-water mark and drop everything below 42.
         assert_eq!(last_event.get(&1), None);
         // Or `node_addresses` would keep answering for a removed node.
         assert_eq!(addrs.get(&1), None);
+        // Or a report the old subscription left half-sent would sit forever:
+        // node 1's next message starts from a clean accumulator (`None` seen
+        // above would otherwise still be pending).
+        assert_eq!(pending.absorb_message(1, &bare_report(None), "test"), Some(Vec::new()));
         // Strictly per-node: the other supervisor is untouched.
         assert_eq!(last_event.get(&2), Some(&7));
         assert_eq!(addrs.get(&2).map(Vec::len), Some(1));
+        assert_eq!(pending.absorb_message(2, &bare_report(Some(true)), "test"), None);
     }
 
     #[test]
     fn forgetting_an_unknown_node_is_a_no_op() {
         let mut last_event = HashMap::new();
         let mut addrs = HashMap::new();
-        forget_node(&mut last_event, &mut addrs, 99);
+        let mut pending = PendingReports::default();
+        forget_node(&mut last_event, &mut addrs, &mut pending, 99);
         assert!(last_event.is_empty());
         assert!(addrs.is_empty());
+        assert_eq!(pending.absorb_message(99, &bare_report(None), "test"), Some(Vec::new()));
     }
 
     /// `subs` and `liveness` are the guard's, not ours: `forget_node` does not
@@ -645,11 +675,11 @@ mod tests {
     /// read the comment explaining why the guard owns them.
     #[test]
     fn the_subscription_lifetime_maps_are_not_touched_here() {
-        fn assert_two_maps(
-            _f: fn(&mut HashMap<u64, u64>, &mut HashMap<u64, Vec<String>>, u64),
+        fn assert_expected_caches(
+            _f: fn(&mut HashMap<u64, u64>, &mut HashMap<u64, Vec<String>>, &mut PendingReports, u64),
         ) {
         }
-        assert_two_maps(forget_node);
+        assert_expected_caches(forget_node);
     }
 
     #[test]
