@@ -9,7 +9,7 @@ use matter_rs_wire::node::CommissionableNodeData;
 
 use crate::addr::split_ip_port;
 use crate::api::CommandError;
-use crate::commands::{err, invalid, narrow, opt_str, opt_u64, require_u64, stack_err};
+use crate::commands::{err, invalid, narrow, opt_str, opt_u64, opt_u64_strict, require_u64, stack_err};
 use crate::real::MatterController;
 use crate::stack_api::{CommissionRequest, PaseTarget};
 use crate::storage::{allocate_node_id, format_node_date, NodeRecord};
@@ -142,7 +142,7 @@ pub async fn open_commissioning_window(c: &MatterController, args: &Map<String, 
     c.ensure_node(node_id)?;
     // iteration/option/discriminator accepted-and-ignored (Node behavior).
     // 65536 used to truncate to 0, i.e. a window closing the instant it opened.
-    let timeout: u16 = narrow(opt_u64(args, "timeout").unwrap_or(300), "timeout")?;
+    let timeout: u16 = narrow(opt_u64_strict(args, "timeout")?.unwrap_or(300), "timeout")?;
     let info = c
         .stack
         .open_commissioning_window(node_id, timeout)
@@ -355,6 +355,27 @@ mod tests {
             setup_qr_code: "MT:ABC".into() }));
         let v = call(&r, "open_commissioning_window", json!({"node_id": 5})).await.unwrap();
         assert_eq!(v, json!({"setup_pin_code": 12345678, "setup_manual_code": "36296231493", "setup_qr_code": "MT:ABC"}));
+        assert!(r.stack.calls().iter().any(|c| c == "ocw node=5 timeout=300"));
+    }
+
+    /// A present `timeout` that is not a u64 used to fall back to the 300s
+    /// default via `as_u64 -> None` — a client asking for `-1` or `2.5` got a
+    /// silently different window than requested. Absent or JSON null still
+    /// means the default.
+    #[tokio::test]
+    async fn open_commissioning_window_rejects_a_non_u64_timeout() {
+        let r = rig_with_nodes(vec![node_record(5)]);
+        for bad in [json!(-1), json!(2.5)] {
+            let e = call(&r, "open_commissioning_window", json!({"node_id": 5, "timeout": bad}))
+                .await
+                .unwrap_err();
+            assert_eq!(e.details, format!("invalid value for timeout: {bad}"));
+        }
+        *r.stack.window_response.lock().unwrap() = Some(Ok(WindowInfo {
+            setup_pin_code: 1, setup_manual_code: "m".into(), setup_qr_code: "q".into() }));
+        call(&r, "open_commissioning_window", json!({"node_id": 5, "timeout": null}))
+            .await
+            .unwrap();
         assert!(r.stack.calls().iter().any(|c| c == "ocw node=5 timeout=300"));
     }
 

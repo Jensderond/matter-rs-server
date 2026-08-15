@@ -26,7 +26,9 @@ use rs_matter::im::client::{ImClient as _, SubscribeEstablished, SubscribeOutcom
 use rs_matter::im::{AttrPath, EventPath, GenericPath};
 use rs_matter::transport::exchange::Exchange;
 
-use crate::ctx::{with_timeout, StackCtx, INTERVIEW_TIMEOUT_SECS};
+use crate::ctx::{
+    map_err, map_err_established, with_timeout_mapped, StackCtx, INTERVIEW_TIMEOUT_SECS,
+};
 use crate::reports::{walk_events, AttrAccumulator};
 
 /// Report no *more* often than this. 0 = "as soon as something changes", which
@@ -142,8 +144,12 @@ async fn establish<C: Crypto>(
 
     // A wildcard priming read is interview-sized — a bridge chunks for a long
     // time — so it gets the interview budget rather than the per-transaction one.
-    with_timeout(INTERVIEW_TIMEOUT_SECS, async {
+    // Phase split for the error mapping: once `initiate` has returned Ok, a
+    // `NotFound` is the device's IM status, not an mDNS resolution failure.
+    let case_up = core::cell::Cell::new(false);
+    with_timeout_mapped(INTERVIEW_TIMEOUT_SECS, async {
         let exchange = Exchange::initiate(ctx.matter, &ctx.crypto, ctx.fab_idx, node_id).await?;
+        case_up.set(true);
         let mut sender = exchange.subscribe_sender().await?;
 
         let mut chunk = loop {
@@ -213,7 +219,7 @@ async fn establish<C: Crypto>(
         let _ = ctx.events.send(StackEvent::PrimingSnapshot { node_id, attributes });
 
         Ok(established)
-    })
+    }, |e| if case_up.get() { map_err_established(e) } else { map_err(e) })
     .await
 }
 

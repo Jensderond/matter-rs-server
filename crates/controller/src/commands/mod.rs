@@ -36,6 +36,18 @@ pub fn require_u64(args: &Map<String, Value>, key: &str) -> Result<u64, CommandE
         .ok_or_else(|| invalid(format!("missing or invalid required argument: {key}")))
 }
 pub fn opt_u64(args: &Map<String, Value>, key: &str) -> Option<u64> { args.get(key).and_then(Value::as_u64) }
+
+/// `opt_u64` that tells absent apart from invalid: a missing key (or JSON null,
+/// which HA sends for "not set") is `None`, but a key that is present and not a
+/// u64 — negative, fractional, a string — is the client's error, not something
+/// to silently replace with the caller's default.
+pub fn opt_u64_strict(args: &Map<String, Value>, key: &str) -> Result<Option<u64>, CommandError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_u64().map(Some)
+            .ok_or_else(|| invalid(format!("invalid value for {key}: {v}"))),
+    }
+}
 pub fn opt_bool(args: &Map<String, Value>, key: &str) -> Option<bool> { args.get(key).and_then(Value::as_bool) }
 pub fn opt_str<'a>(args: &'a Map<String, Value>, key: &str) -> Option<&'a str> { args.get(key).and_then(Value::as_str) }
 pub fn require_str<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a str, CommandError> {

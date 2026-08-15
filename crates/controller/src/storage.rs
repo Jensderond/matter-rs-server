@@ -77,8 +77,20 @@ impl std::fmt::Debug for ServerIdentity {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct WifiCredential { pub ssid: String, pub password: String }
+
+/// Hand-written for the same reason as `ServerIdentity`'s: `ConfigData` holds
+/// every stored Wi-Fi password and derives `Debug`, so one `{cfg:?}` in a log
+/// line would print them all. The SSID is not a secret and stays visible.
+impl std::fmt::Debug for WifiCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WifiCredential")
+            .field("ssid", &self.ssid)
+            .field("password", &format_args!("[redacted]"))
+            .finish()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -416,6 +428,19 @@ mod tests {
         assert!(printed.contains("fabric_id: 1"));
         assert!(printed.contains("controller_node_id: 112233"));
         assert!(printed.contains("version: 1"));
+    }
+
+    /// Same hazard class as `ServerIdentity`'s keys: `ConfigData` derives `Debug`
+    /// and holds every stored Wi-Fi password, so one `{cfg:?}` in a log line
+    /// would print them all. The SSID is not a secret and stays visible.
+    #[test]
+    fn wifi_credential_debug_redacts_the_password() {
+        let printed = format!("{:?}", WifiCredential {
+            ssid: "front-room".into(), password: "hunter2-secret".into(),
+        });
+        assert!(!printed.contains("hunter2-secret"), "password leaked: {printed}");
+        assert!(printed.contains("[redacted]"));
+        assert!(printed.contains("front-room"));
     }
 
     /// The migration trap `version` exists to defuse: `ServerIdentity` has no

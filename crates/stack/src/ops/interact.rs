@@ -22,7 +22,10 @@ use rs_matter::transport::exchange::{Exchange, MAX_EXCHANGE_TX_BUF_SIZE};
 use rs_matter::utils::storage::WriteBuf;
 use serde_json::{Map, Value};
 
-use crate::ctx::{with_timeout, StackCtx, IM_TIMEOUT_SECS, INTERVIEW_TIMEOUT_SECS};
+use crate::ctx::{
+    map_err, map_err_established, with_timeout_mapped, StackCtx, IM_TIMEOUT_SECS,
+    INTERVIEW_TIMEOUT_SECS,
+};
 use crate::reports::AttrAccumulator;
 use crate::tlv_json::{self, TypeHint};
 
@@ -40,6 +43,15 @@ fn normalize_timed(timed_ms: Option<u16>, cmd: &Cmd) -> Option<u16> {
     timed_ms
         .filter(|ms| *ms > 0)
         .or(if cmd.is_timed { Some(DEFAULT_TIMED_MS) } else { None })
+}
+
+/// The error mapping for an op whose exchange may or may not be up yet: before
+/// `Exchange::initiate` succeeds a `NotFound` is an mDNS resolution failure;
+/// after it, the same code is the device's IM status (see
+/// `ctx::map_err_established`). The `Cell` is set by the op's future the moment
+/// `initiate` returns Ok and read by the mapper after that future settles.
+fn phase_mapper(established: &core::cell::Cell<bool>) -> impl FnOnce(Error) -> StackError + '_ {
+    |e| if established.get() { map_err_established(e) } else { map_err(e) }
 }
 
 fn to_attr_path(p: &AttributePathSpec) -> AttrPath {
@@ -104,8 +116,10 @@ async fn read_attributes_inner<C: Crypto>(
 ) -> Result<Vec<(String, Value)>, StackError> {
     let attr_paths: Vec<AttrPath> = paths.iter().map(to_attr_path).collect();
 
-    with_timeout(timeout_secs, async {
+    let established = core::cell::Cell::new(false);
+    with_timeout_mapped(timeout_secs, async {
         let exchange = Exchange::initiate(ctx.matter, &ctx.crypto, ctx.fab_idx, node_id).await?;
+        established.set(true);
         let mut sender = exchange.read_sender().await?;
 
         let mut chunk = loop {
@@ -143,7 +157,7 @@ async fn read_attributes_inner<C: Crypto>(
         }
 
         Ok(acc.into_pairs())
-    })
+    }, phase_mapper(&established))
     .await
 }
 
@@ -182,8 +196,10 @@ pub(crate) async fn write_attribute<C: Crypto>(
             )
         })?;
 
-    with_timeout(IM_TIMEOUT_SECS, async {
+    let established = core::cell::Cell::new(false);
+    with_timeout_mapped(IM_TIMEOUT_SECS, async {
         let exchange = Exchange::initiate(ctx.matter, &ctx.crypto, ctx.fab_idx, node_id).await?;
+        established.set(true);
         let mut sender = exchange.write_sender(None).await?;
 
         let handle = loop {
@@ -240,7 +256,7 @@ pub(crate) async fn write_attribute<C: Crypto>(
                 ),
             )
         }))
-    })
+    }, phase_mapper(&established))
     .await?
 }
 
@@ -276,8 +292,10 @@ pub(crate) async fn invoke<C: Crypto>(
     // `StackError` of its own (an IM status is richer than any rs-matter
     // `ErrorCode` it could be laundered through), so it travels as the success
     // value of the timeout future and is unwrapped by the trailing `?`.
-    with_timeout(IM_TIMEOUT_SECS, async {
+    let established = core::cell::Cell::new(false);
+    with_timeout_mapped(IM_TIMEOUT_SECS, async {
         let exchange = Exchange::initiate(ctx.matter, &ctx.crypto, ctx.fab_idx, node_id).await?;
+        established.set(true);
         let mut sender = exchange.invoke_sender(timed_ms).await?;
 
         let mut chunk = loop {
@@ -354,7 +372,7 @@ pub(crate) async fn invoke<C: Crypto>(
         }
 
         Ok(result)
-    })
+    }, phase_mapper(&established))
     .await?
 }
 

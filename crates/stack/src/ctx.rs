@@ -161,6 +161,23 @@ pub(crate) fn map_err(e: Error) -> StackError {
     }
 }
 
+/// `map_err` for errors raised *after* `Exchange::initiate` returned Ok.
+///
+/// At that point the peer was resolved and a session opened, so a `NotFound`
+/// can no longer mean "no mDNS record". What does produce it there: a device
+/// answering a DefaultSuccess command with a bare `StatusResponse(NotFound)`,
+/// which rs-matter's client converts via `IMStatusCode::to_error_code`
+/// (`rs-matter-ref/rs-matter/src/im/client.rs:960`).
+pub(crate) fn map_err_established(e: Error) -> StackError {
+    match e.code() {
+        ErrorCode::NotFound => StackError::new(
+            StackErrorKind::Sdk,
+            "device answered with IM status NotFound (0x8b)",
+        ),
+        _ => map_err(e),
+    }
+}
+
 /// Run `fut` under a wall-clock budget, mapping both outcomes onto `StackError`.
 ///
 /// rs-matter's own MRP retries can outlive any single caller's patience (a
@@ -168,15 +185,20 @@ pub(crate) fn map_err(e: Error) -> StackError {
 /// operation needs an outer bound. Ported from the spike's `with_timeout`
 /// (`spike/src/main.rs:404`), with the timeout surfacing as `Timeout` instead
 /// of a synthetic `RxTimeout`.
-pub(crate) async fn with_timeout<T>(
+///
+/// `map` converts the future's error: every caller initiates a CASE exchange
+/// and needs the pre/post-`initiate` phase split (see `map_err_established`),
+/// so there is no unmapped convenience form.
+pub(crate) async fn with_timeout_mapped<T>(
     secs: u64,
     fut: impl Future<Output = Result<T, Error>>,
+    map: impl FnOnce(Error) -> StackError,
 ) -> Result<T, StackError> {
     let fut = pin!(fut);
     let timer = pin!(Timer::after(Duration::from_secs(secs)));
 
     match select(fut, timer).await {
-        Either::First(r) => r.map_err(map_err),
+        Either::First(r) => r.map_err(map),
         Either::Second(()) => {
             let message = format!("IM operation timed out after {secs}s");
             tracing::warn!("{message}");
@@ -215,9 +237,37 @@ mod tests {
         assert_eq!(map_err(ErrorCode::NoSession.into()).kind, StackErrorKind::Sdk);
     }
 
+    /// After `Exchange::initiate` has returned Ok the peer was resolved and a
+    /// session opened, so a later `NotFound` is the device answering with IM
+    /// status NotFound (0x8b) — reporting it as an mDNS failure sends whoever
+    /// reads the error debugging the wrong layer.
+    #[test]
+    fn established_notfound_is_an_im_status_not_mdns() {
+        let e = map_err_established(ErrorCode::NotFound.into());
+        assert_eq!(e.kind, StackErrorKind::Sdk);
+        assert_eq!(e.message, "device answered with IM status NotFound (0x8b)");
+        // Every other code still routes through the base mapping.
+        assert_eq!(map_err_established(ErrorCode::Busy.into()).message, BUSY_MESSAGE);
+        assert_eq!(map_err_established(ErrorCode::RxTimeout.into()).kind, StackErrorKind::Timeout);
+        assert_eq!(map_err_established(ErrorCode::Invalid.into()).message, "Error::Invalid");
+    }
+
+    /// The phase split travels through `with_timeout_mapped`: the caller-chosen
+    /// mapper, not the blanket `map_err`, sees the operation's error.
+    #[test]
+    fn timeout_wrapper_applies_the_callers_mapper() {
+        let e = block_on(with_timeout_mapped(
+            30,
+            core::future::ready(Err::<(), Error>(ErrorCode::NotFound.into())),
+            map_err_established,
+        ))
+        .expect_err("ready Err must surface");
+        assert_eq!(e.message, "device answered with IM status NotFound (0x8b)");
+    }
+
     #[test]
     fn timeout_reports_the_budget_it_blew() {
-        let e = block_on(with_timeout(1, core::future::pending::<Result<(), Error>>()))
+        let e = block_on(with_timeout_mapped(1, core::future::pending::<Result<(), Error>>(), map_err))
             .expect_err("pending future must time out");
         assert_eq!(e.kind, StackErrorKind::Timeout);
         assert_eq!(e.message, "IM operation timed out after 1s");
@@ -225,16 +275,17 @@ mod tests {
 
     #[test]
     fn value_passes_through() {
-        let v = block_on(with_timeout(30, core::future::ready(Ok::<u8, Error>(7))))
+        let v = block_on(with_timeout_mapped(30, core::future::ready(Ok::<u8, Error>(7)), map_err))
             .expect("ready future must pass through");
         assert_eq!(v, 7);
     }
 
     #[test]
     fn inner_error_is_mapped_not_swallowed() {
-        let e = block_on(with_timeout(
+        let e = block_on(with_timeout_mapped(
             30,
             core::future::ready(Err::<(), Error>(ErrorCode::Busy.into())),
+            map_err,
         ))
         .expect_err("inner error must surface");
         assert_eq!(e.kind, StackErrorKind::Busy);
