@@ -245,6 +245,15 @@ async fn establish<C: Crypto>(
 /// (they are per-node caches), so clearing them belongs to the `StopSupervisor`
 /// arm of `crate::runtime::request_loop`, which does it in `runtime::forget_node`
 /// alongside removing the `ctx.supervisors` entry.
+///
+/// `pending_reports` is also subscription-lifetime, like `subs`/`liveness` —
+/// but it is deliberately NOT guard-owned: a half-received report must be
+/// dropped as soon as a *new* subscription replaces the old one, which is
+/// earlier than this guard's `Drop` (that only runs once the task itself
+/// ends). So it is released by [`establish`] on every (re)subscribe and, on
+/// node removal, by `runtime::forget_node` — the same two places that already
+/// clear `last_event`/`addrs`, keeping this doc's contract and `ctx.rs`'s
+/// cleanup contract in agreement.
 struct SubscriptionGuard<'a> {
     subs: &'a RefCell<HashMap<u64, u32>>,
     liveness: &'a RefCell<HashMap<u64, Instant>>,

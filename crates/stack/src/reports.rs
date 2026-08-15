@@ -169,8 +169,7 @@ impl AttrAccumulator {
             // reachable here is a genuinely malformed report. Say so loudly
             // instead of handing the client a truncated array.
             tracing::warn!(
-                "{who}: list append for {key} has no array to append to; the list is split \
-                 across ReportData messages and is reported incomplete"
+                "{who}: malformed report: list append for {key} has no opening array; restarting"
             );
             self.orphan_appends.push(key.clone());
             self.index.insert(key.clone(), self.out.len());

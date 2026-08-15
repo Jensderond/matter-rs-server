@@ -7,18 +7,32 @@
     "expect": [{"0": 42, "1": "�"}]
   },
   {
-    "name": "56/5 nested epoch: TimeZoneStruct.validAt shifts to Unix micros",
-    "why": "Converters.ts EpochUS at any depth (lines 394-398); Matter 0 == Unix 946684800s",
+    "name": "56/5 nested epoch: TimeZoneStruct.validAt passes through raw",
+    "why": "settled 2026-08-15: matter.js's WS wire is Matter-epoch at every depth (TimeSyncCommandsTest.ts:61,64; Converters.ts:394-399 subtracts the offset matter->WS, re-encoding to Matter epoch). Nested fields must NOT be shifted.",
     "cluster": 56, "attr": 5,
     "tlv": "16 15 21 00 10 0e 24 01 00 2c 02 03 43 45 54 18 18",
-    "expect": [{"0": 3600, "1": 946684800000000, "2": "CET"}]
+    "expect": [{"0": 3600, "1": 0, "2": "CET"}]
   },
   {
     "name": "56/0 top-level epoch_us",
-    "why": "pre-existing behaviour, must survive the typed-walk rewrite",
+    "why": "documents OUR pre-existing top-level Unix conversion: a known divergence from Node's wire (which stays Matter-epoch even at the top level), pending a maintainer ruling — see README Accepted parity gaps #7",
     "cluster": 56, "attr": 0,
     "tlv": "04 00",
     "expect": 946684800000000
+  },
+  {
+    "name": "struct-in-list with a nested struct field (unknown cluster, exercises recursion)",
+    "why": "post-revert, attr_value_to_json has no typed steering left below the top level; the generic tlv_to_json recursive walk must still handle a struct nested inside a struct nested inside a list element",
+    "cluster": 64512, "attr": 1,
+    "tlv": "16 15 35 00 24 00 07 18 18 18",
+    "expect": [{"0": {"0": 7}}]
+  },
+  {
+    "name": "56/0 nullable epoch attribute sent as TLV Null",
+    "why": "apply_epoch passes Null through untouched (a nullable epoch_us attribute reporting no value)",
+    "cluster": 56, "attr": 0,
+    "tlv": "14",
+    "expect": null
   },
   {
     "name": "octet string emits base64",

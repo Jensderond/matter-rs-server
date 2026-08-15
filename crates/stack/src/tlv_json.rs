@@ -158,69 +158,32 @@ fn tlv_to_json_at(elem: &TLVElement, depth: u8) -> Result<Value, Error> {
     })
 }
 
-/// Attribute values stay tag-based on the wire; the type-driven part is the
-/// epoch shift, applied at *every* depth of the walk like Node's model-driven
-/// converter (`Converters.ts` classifyModel lines 207-233 /
-/// convertMatterToWebSocket lines 394-398) — accepted deviation #2, retired.
+/// Attribute values stay tag-based on the wire; the only type-driven step is
+/// the epoch shift, and only at the top level.
+///
+/// Nested epoch fields deliberately pass through raw: matter.js's own wire
+/// format carries Matter-epoch values at every depth, not Unix. The JS
+/// layer's *internal* values are Unix
+/// (`matterjs-server/packages/ws-controller/test/TimeSyncCommandsTest.ts:61`
+/// — `utcTime` equals `BigInt(NOW_MS) * 1000n`, Unix µs; `:64`/`:173-176`
+/// pass a positive `MATTER_EPOCH_OFFSET_US` for an entry required to be "at
+/// the Matter epoch", which is what pins the constant's sign), but
+/// `Converters.ts:394-399` *subtracts* that offset when converting
+/// matter -> WS — i.e. it re-encodes back to Matter epoch before the value
+/// ever reaches the wire. So passing nested fields through raw here matches
+/// Node's actual wire bytes exactly.
+///
+/// The top-level shift to Unix, by contrast, is pre-existing plan-2
+/// behaviour: a known divergence from Node's wire (which stays Matter-epoch
+/// even at the top level) whose parity question is open for the maintainer
+/// to rule on — see README's "Accepted parity gaps" #7. This function does
+/// not change that; it only stops shifting nested fields, which Task 5 had
+/// wrongly started doing.
 pub fn attr_value_to_json(cluster: u32, attr: u32, elem: &TLVElement) -> Result<Value, Error> {
-    let Some((meta, a)) = matter_rs_gen::cluster(cluster).and_then(|c| c.attr(attr).map(|a| (c, a)))
-    else {
-        // Unknown attribute: untyped fallback, exactly as before.
-        return tlv_to_json(elem);
-    };
-    typed_to_json(elem, a.ty, meta, 0)
-}
-
-/// Tag-based conversion with the IDL type threaded through the walk. Keys are
-/// numeric tags (unlike the named walk in `tlv_to_json_named_at`); the type
-/// only steers leaf conversion. Arrays recurse with the same `ty` because the
-/// IDL spells a list as `Type name[]` — element type == attribute type.
-fn typed_to_json(
-    elem: &TLVElement,
-    ty: &str,
-    cluster: &'static Cluster,
-    depth: u8,
-) -> Result<Value, Error> {
-    if depth > MAX_DEPTH {
-        return Err(invalid());
-    }
-    if let Some(s) = lossy_utf8(elem)? {
-        return Ok(s);
-    }
-    match elem.value()? {
-        TLVValue::Array | TLVValue::List => {
-            let mut arr = Vec::new();
-            for child in elem.container()?.iter() {
-                arr.push(typed_to_json(&child?, ty, cluster, depth + 1)?);
-            }
-            Ok(Value::Array(arr))
-        }
-        TLVValue::Struct => match cluster.find_struct(ty) {
-            Some(nested) => {
-                let mut obj = Map::new();
-                for child in elem.container()?.iter() {
-                    let child = child?;
-                    match child.tag()? {
-                        TLVTag::Context(n) => {
-                            let v = match nested.fields.iter().find(|f| f.code == n as u32) {
-                                Some(f) => typed_to_json(&child, f.ty, cluster, depth + 1)?,
-                                // Field ids this IDL revision doesn't know
-                                // still have to reach the client.
-                                None => tlv_to_json_at(&child, depth + 1)?,
-                            };
-                            obj.insert(n.to_string(), v);
-                        }
-                        other => tracing::debug!("skipping non-context struct member tag {other:?}"),
-                    }
-                }
-                Ok(Value::Object(obj))
-            }
-            // A struct whose type the IDL doesn't name: untyped fallback.
-            None => tlv_to_json_at(elem, depth),
-        },
-        // Leaf: convert, then shift if the type is an epoch.
-        _ => apply_epoch(ty, tlv_to_json_at(elem, depth)?),
-    }
+    let ty = matter_rs_gen::cluster(cluster)
+        .and_then(|c| c.attr(attr))
+        .map_or("", |a| a.ty);
+    apply_epoch(ty, tlv_to_json(elem)?)
 }
 
 pub fn tlv_to_json_named(elem: &TLVElement, fields: &[Field], cluster: &Cluster) -> Result<Value, Error> {
@@ -944,37 +907,44 @@ mod tests {
         assert_eq!(tlv_to_json(&TLVElement::new(&oct)).unwrap(), json!("/wA="));
     }
 
+    /// A struct-typed field whose element is an invalid-UTF-8 string converts
+    /// lossily instead of hard-failing.
     #[test]
     fn invalid_utf8_in_struct_field_converts_lossily_via_named_path() {
-        // named_field_to_json guards lossy_utf8 before calling elem.value()?,
-        // preventing TLVTypeMismatch when a device sends invalid UTF-8 where a
-        // struct-typed field was expected. The assertion below directly tests
-        // that the guard in named_field_to_json prevents the hard-fail.
-        // To test named_field_to_json, we construct a scenario where
-        // tlv_to_json_named calls it: a root struct with a field that expects
-        // a struct but receives invalid UTF-8 bytes.
+        // GroupKeyManagement(63) KeySetWriteRequest.groupKeySet (field 0) is
+        // typed GroupKeySetStruct. Write a valid UTF-8 string in that slot
+        // (instead of a nested struct), then corrupt its first payload byte
+        // to invalid UTF-8 — this drives tlv_to_json_named_at into finding
+        // field 0 and calling named_field_to_json on it, unlike a bare
+        // top-level element, which returns from tlv_to_json_named's earlier
+        // "not a struct" guard without ever reaching named_field_to_json.
         let cluster = matter_rs_gen::cluster(63).unwrap();
         let input = cluster.find_struct("KeySetWriteRequest").unwrap();
-        // Verify the guard works by
-        // checking that invalid UTF-8 at the root level (where tlv_to_json_named
-        // calls it) converts lossily instead of failing. The root of a named
-        // call is expected to be a struct, but the guard should convert any
-        // UTF-8 string lossily if somehow it appears.
-        let root_utf8 = [0x0C, 0x02, 0xFF, b'y'];  // Invalid UTF-8 at root
-        let v = tlv_to_json_named(&TLVElement::new(&root_utf8), input.fields,
-                                   cluster).unwrap();
-        // Instead of a struct, the invalid UTF-8 converts lossily via the guard
-        // in tlv_to_json_named_at (which calls lossy_utf8 before elem.value()).
-        assert_eq!(v, json!("\u{FFFD}y"));
+        let mut bytes = build(|w| {
+            w.start_struct(&TLVTag::Anonymous).unwrap();
+            w.utf8(&TLVTag::Context(0), "ay").unwrap();
+            w.end_container().unwrap();
+        });
+        // 'a' (0x61) appears exactly once, as the string's first payload byte.
+        let a = bytes.iter().position(|&b| b == b'a').unwrap();
+        bytes[a] = 0xFF;
+        let v = tlv_to_json_named(&TLVElement::new(&bytes), input.fields, cluster).unwrap();
+        assert_eq!(v, json!({"groupKeySet": "\u{FFFD}y"}));
     }
 
-    /// Accepted deviation #2 retired: Node converts epoch fields at every
-    /// depth of the model walk (Converters.ts classifyModel lines 207-233 +
-    /// convertMatterToWebSocket lines 394-398), not just the top level.
+    /// Nested epoch fields pass through raw, matching Node's actual wire
+    /// bytes: matter.js's WS wire carries Matter-epoch values at every depth
+    /// (`TimeSyncCommandsTest.ts:61` — the JS layer's own `utcTime` is Unix
+    /// µs; `:64`/`:173-176` pin `MATTER_EPOCH_OFFSET_US` as positive), and
+    /// `Converters.ts:394-399` subtracts that offset converting matter -> WS,
+    /// re-encoding back to Matter epoch before the value reaches the wire.
     /// TimeSynchronization.timeZone (56/5) is a list of TimeZoneStruct whose
-    /// field 1 validAt is epoch_us: the nested value must come out Unix.
+    /// field 1 validAt is epoch_us: the nested value must stay raw. Top-level
+    /// epoch attributes still convert to Unix (pre-existing plan-2 behaviour,
+    /// README "Accepted parity gaps" #7 — open maintainer question, not
+    /// changed here).
     #[test]
-    fn epoch_fields_convert_inside_structs_and_lists() {
+    fn nested_epoch_fields_pass_through_raw_top_level_still_converts() {
         // [ { 0: offset=3600, 1: validAt=0 (Matter epoch), 2: "CET" } ]
         let bytes = {
             let mut buf = [0u8; 128];
@@ -989,11 +959,10 @@ mod tests {
             wb.as_slice().to_vec()
         };
         let v = attr_value_to_json(56, 5, &TLVElement::new(&bytes)).unwrap();
-        // Matter epoch 0 == 2000-01-01T00:00:00Z == 946684800 Unix seconds.
         assert_eq!(
             v,
-            json!([{"0": 3600, "1": 946_684_800_000_000u64, "2": "CET"}]),
-            "validAt must be shifted to Unix micros at depth 2"
+            json!([{"0": 3600, "1": 0, "2": "CET"}]),
+            "validAt is nested: it must pass through raw, matching Node's wire"
         );
 
         // Top-level epoch attributes keep working: 56/0 UTCTime is epoch_us.
@@ -1006,22 +975,6 @@ mod tests {
         assert_eq!(
             attr_value_to_json(56, 0, &TLVElement::new(&top)).unwrap(),
             json!(946_684_800_000_000u64)
-        );
-
-        // A struct field the IDL revision doesn't know passes through raw.
-        let unknown_field = {
-            let mut buf = [0u8; 64];
-            let mut wb = WriteBuf::new(&mut buf);
-            wb.start_array(&TLVTag::Anonymous).unwrap();
-            wb.start_struct(&TLVTag::Anonymous).unwrap();
-            wb.u64(&TLVTag::Context(200), 5).unwrap();
-            wb.end_container().unwrap();
-            wb.end_container().unwrap();
-            wb.as_slice().to_vec()
-        };
-        assert_eq!(
-            attr_value_to_json(56, 5, &TLVElement::new(&unknown_field)).unwrap(),
-            json!([{"200": 5}])
         );
     }
 }

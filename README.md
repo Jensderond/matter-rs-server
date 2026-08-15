@@ -233,7 +233,7 @@ narrow the WS bind only; they do not affect the Matter transport.
 
 ### Accepted parity gaps vs the Node server
 
-The plan fixes these six deliberately (its "known, accepted v1 deviations"),
+The plan fixes these seven deliberately (its "known, accepted v1 deviations"),
 recorded here **so nobody "fixes" them silently.** Plan 3's fixtures are where the
 ones that need tightening get tightened.
 
@@ -254,6 +254,17 @@ ones that need tightening get tightened.
    client drops events (with a warning) instead of being throttled.
 6. **`get_vendor_names` is the static CSA table only** — 1245 entries compiled in,
    no DCL lookup, so a vendor id newer than the table has no name.
+7. **Epoch conversion is top-level only.** `attr_value_to_json` shifts a
+   top-level `epoch_s`/`epoch_us` attribute value to Unix, but Node's wire
+   carries Matter-epoch values at *every* depth — the JS layer's own values are
+   Unix internally, and `Converters.ts` subtracts the Matter-epoch offset
+   converting matter -> WS, re-encoding back to Matter epoch before the value
+   reaches the wire (`matterjs-server/packages/ws-controller/test/
+   TimeSyncCommandsTest.ts:61,64`; `Converters.ts:394-399`). Nested epoch
+   fields here pass through raw, matching Node's wire exactly; the top-level
+   shift to Unix is pre-existing plan-2 behaviour and a known divergence from
+   Node's wire whose parity question is still open — whether to drop it for
+   byte parity is a maintainer decision, not made here.
 
 ## Test
 

@@ -2819,7 +2819,7 @@ Shared flow `commission(c, target) -> Result<Value /* MatterNodeData */, Command
 - `commission_with_code`: `code` required, non-empty → else code 8 `No pairing code provided`; `network_only` accepted-and-ignored (no BLE, always on-network). Target `PaseTarget::Code { code }`.
 - `commission_on_network`: `setup_pin_code` required → else code 8 `No passcode provided`. `filter_type` 1/2/3 require `filter` → exact errors `filter required for filter_type 1 (short discriminator)`, `... 2 (long discriminator)`, `... 3 (vendor ID)`. `ip_addr` (unless it starts with `fe80`) → `PaseTarget::Address { addr: format!("{ip_addr}:5540") }`, else `PaseTarget::OnNetwork { passcode, long_discriminator (type 2), short_discriminator (type 1), vendor_id (type 3) }`.
 - `open_commissioning_window`: `node_id` required, `timeout` default 300 (`iteration`/`option`/`discriminator` accepted-and-ignored, Node behavior); result `{"setup_pin_code": ..., "setup_manual_code": ..., "setup_qr_code": ...}`.
-- `discover` / `discover_commissionable_nodes`: `stack.browse_commissionable(3000)` → `Vec<CommissionableNodeData>` with per-entry defaults `host_name: "000000000000"`, `vendor_id: -1`, `product_id: -1`, `commissioning_mode: 1`, `pairing_hint: 0`, `supports_tcp: false`, `addresses: [ip]`, `instance_name: Some(...)`, `port: Some(port)`; everything else None (accepted deviation #5). **[README gap list renumbered 2026-08-15 after #2 was retired; this item is now #4 there.]**
+- `discover` / `discover_commissionable_nodes`: `stack.browse_commissionable(3000)` → `Vec<CommissionableNodeData>` with per-entry defaults `host_name: "000000000000"`, `vendor_id: -1`, `product_id: -1`, `commissioning_mode: 1`, `pairing_hint: 0`, `supports_tcp: false`, `addresses: [ip]`, `instance_name: Some(...)`, `port: Some(port)`; everything else None (accepted deviation #5). **[README gap list renumbered 2026-08-15 after #2 was retired; this item is now #4 there. #2's retirement was itself reverted later the same day, in the plan 3 final-review wave, once the Node wire direction was settled (matter.js's WS wire is Matter-epoch at every depth) — #2 is back, appended as #7; this item's number, #4, is unaffected and still correct.]**
 
 **`credentials.rs` semantics** (all mutations end with `save_config` + broadcast `server_info_updated` carrying fresh `server_info`; failures of the event send ignored):
 - `set_wifi_credentials`: `ssid` required, `credentials` optional-empty, `id` default `"default"`. `validate_credential_id(id, existing wifi ids)` → code 8 on Err. Empty `credentials`: allowed only when an existing entry with this id has the SAME ssid (password kept) else code 8 `WiFi password is required (omit it only to keep the existing password for an unchanged SSID)`. Result `{}`.
@@ -3339,10 +3339,17 @@ pub const MATTER_EPOCH_OFFSET_US: u64 = 946_684_800_000_000;
 pub fn tlv_to_json(elem: &TLVElement) -> Result<serde_json::Value, rs_matter::error::Error>;
 /// Attribute value -> JSON, applying epoch_s/epoch_us -> Unix at top level
 /// when `gen` knows the attribute's type (accepted deviation #2 for nesting).
-/// **[RESOLVED 2026-08-15, plan 3 Task 5: epoch conversion now runs at every
-/// depth of the tag-based walk (`typed_to_json`); accepted deviation #2 was
-/// retired, not renumbered — deleted from the README "Accepted parity gaps"
-/// list, whose surviving items are now numbered 1-6 contiguously.]**
+/// **[RESOLVED 2026-08-15, plan 3 Task 5: epoch conversion briefly ran at
+/// every depth of the tag-based walk (`typed_to_json`), and accepted
+/// deviation #2 was retired on that basis. REVERTED same day, in the plan 3
+/// final-review wave, once the Node wire direction was actually settled:
+/// matter.js's WS wire carries Matter-epoch values at every depth (the JS
+/// layer's own values are Unix, but `Converters.ts` subtracts the offset
+/// converting matter -> WS, re-encoding back to Matter epoch before the wire).
+/// `typed_to_json` was deleted and `attr_value_to_json` reverted to
+/// top-level-only conversion; deviation #2 is back in the README "Accepted
+/// parity gaps" list (now item #7 there, appended rather than reusing #2's
+/// old slot).]**
 pub fn attr_value_to_json(cluster: u32, attr: u32, elem: &TLVElement) -> Result<Value, Error>;
 /// TLV -> name-based JSON using a gen struct/event field list (camelCase keys);
 /// unknown field ids fall back to the numeric key. Applies base64/epoch by field type.

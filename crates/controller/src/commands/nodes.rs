@@ -108,10 +108,11 @@ pub async fn ping_node(c: &MatterController, args: &Map<String, Value>) -> Resul
 }
 
 /// Concurrent join preserving input order — Node pings every address in
-/// parallel (`ControllerCommandHandler.ts:1410-1419`), and `attempts * 10s`
-/// per address is too slow to serialize. Spawned tasks rather than a `futures`
-/// dependency; a panicked ping task poisons only its own slot's `expect`,
-/// which matches the old behaviour of a panic in a sequential await.
+/// parallel (`ControllerCommandHandler.ts:1410-1419`), and ~attempts × 1s +
+/// 10s timeout per address is too slow to serialize. Spawned tasks rather
+/// than a `futures` dependency; a panicked ping task poisons only its own
+/// slot's `expect`, which matches the old behaviour of a panic in a
+/// sequential await.
 async fn join_all_concurrent<T: Send + 'static>(
     futs: Vec<impl std::future::Future<Output = T> + Send + 'static>,
 ) -> Vec<T> {
@@ -188,10 +189,12 @@ mod tests {
     /// Node pings every address in parallel (ControllerCommandHandler.ts:1410-1419,
     /// Promise.all); sequential was a plan-2 shortcut with a worst case of
     /// attempts x 10s x N_addresses. Two 300ms sleeps finishing well under
-    /// 600ms proves concurrency; exact timing is deliberately slack.
-    #[tokio::test]
+    /// 600ms proves concurrency; exact timing is deliberately slack. Virtual
+    /// time (`start_paused`) makes the assertion deterministic instead of
+    /// relying on the wall clock and CI scheduling noise.
+    #[tokio::test(start_paused = true)]
     async fn pings_run_concurrently_and_keep_input_order() {
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let out = join_all_concurrent(vec![
             Box::pin(async {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
