@@ -4,13 +4,74 @@ Rust port of the OHF matterjs-server: a Matter controller daemon speaking the
 python-matter-server-compatible WebSocket API that Home Assistant's Matter
 integration uses.
 
-**Status: plan 2 — real controller.** The Matter stack is rs-matter (pinned rev
-`03bc8f2`), all 31 WS commands are implemented, and commissioning / control /
-subscriptions / restart persistence are verified end to end against a virtual
-matter.js device and, at spike time, against real Thread hardware. See
-`docs/superpowers/specs/` for the design, `spike/SPIKE-RESULTS.md` for the
-rs-matter validation, and `scripts/e2e-virtual-device.md` for the acceptance
-runbook.
+**Status: running in production.** The Matter stack is rs-matter (pinned to a
+fork of rev `03bc8f2`, see below), all 31 WS commands are implemented, and
+commissioning / control / subscriptions / restart persistence are verified end
+to end against a virtual matter.js device and real Wi-Fi and Thread hardware.
+An existing matterjs-server installation can be migrated in place — same
+fabric, no re-commissioning (see the next section). Idle RSS is a few MB where
+the Node server uses hundreds. See `docs/superpowers/specs/` for the design,
+`spike/SPIKE-RESULTS.md` for the rs-matter validation, and
+`scripts/e2e-virtual-device.md` for the acceptance runbook.
+
+## Drop-in replacement for matterjs-server
+
+matter-rs-server speaks the python-matter-server WS API (schema 13) on the
+same default port and accepts matterjs-server's CLI flags, so Home
+Assistant's Matter integration and an existing systemd unit both work
+unchanged: point the integration at `ws://<host>:5580/ws` as before.
+
+### 1. Build
+
+    cargo build --release -p matter-rs-server -p matter-rs-migrate
+
+Building on one machine for another (e.g. a Mac building for a Debian LXC)?
+A static musl build runs on any x86-64 Linux with no runtime dependencies:
+
+    cargo zigbuild --release --target x86_64-unknown-linux-musl
+
+(`cargo install cargo-zigbuild`, plus `rustup target add
+x86_64-unknown-linux-musl`.)
+
+### 2. Migrate the existing fabric — or start fresh
+
+**Fresh install:** skip this step; a first run mints a new fabric identity
+under `--storage-path`, and you commission (or re-commission) devices through
+HA as usual.
+
+**Migration** carries the matter.js fabric over so every commissioned device
+keeps working — no factory resets, no re-commissioning. The tool reads the
+matterjs-server store, extracts the CA key, fabric identity and every
+commissioned node, and writes a matter-rs-server store serving the same
+fabric. The source store is never modified.
+
+    # Dry run (default): runs five offline self-checks, prints the plan
+    matter-rs-migrate --from /var/lib/matterjs-server --to /var/lib/matter-rs-server
+
+    # Then, with matterjs-server STOPPED:
+    matter-rs-migrate --from /var/lib/matterjs-server --to /var/lib/matter-rs-server --write
+
+It refuses to overwrite an existing `server.json`, and exits non-zero if any
+self-check fails — fix or report before `--write`.
+
+### 3. Cut over
+
+    systemctl disable --now matterjs-server
+    matter-rs-migrate --from ... --to ... --write     # if migrating
+    install -m755 matter-rs-server matter-rs-migrate /usr/local/bin/
+    # unit file: see "Deployment notes" below
+    systemctl enable --now matter-rs-server
+
+Nodes CASE-connect and re-subscribe within seconds; reload the HA Matter
+integration if it was connected to the old server. **Revert** is symmetric —
+the matterjs-server store was never touched:
+
+    systemctl disable --now matter-rs-server
+    systemctl enable --now matterjs-server
+
+Thread devices additionally need the RA route-info sysctl from the
+deployment notes below — without it they are unreachable and the migration
+looks broken when it is not.
 
 ## Run
 
@@ -92,6 +153,16 @@ warning naming the symptom instead. If you see it, the only fix is to delete
 `server.json` and re-commission every node — a deliberate, destructive operator
 decision.
 
+### The rs-matter fork pin
+
+`crates/stack` pins `github.com/Jensderond/rs-matter` (branch
+`noc-issuer-dn-mirroring` = upstream `03bc8f2` + one additive commit). The
+commit adds what migrated matter.js fabrics need: matter.js roots carry no
+FabricId RDN in the RCAC subject, so the fork adds
+`RcacGenerator::generate_without_fabric_id` and a `NocGenerator` entry point
+that mirrors the issuer DN from the actual RCAC instead of assuming the
+FabricId is present. Both are candidates for an upstream PR.
+
 ## Deployment notes
 
     [Service]
@@ -156,10 +227,6 @@ narrow the WS bind only; they do not affect the Matter transport.
 - **Shutdown drops in-flight work.** A commissioning attempt in progress is
   abandoned, and up to 500 ms of CASE resumption records are lost (cost: one
   handshake).
-- **IM status `NotFound` (0x8b) on a command surfaces as "could not resolve node
-  via mDNS".** rs-matter converts a bare non-success `StatusResponse` to
-  `ErrorCode::NotFound` before our code sees the chunk, and our mapping turns that
-  into the wire code `NodeNotResolving`. The command did reach the node.
 - **`sessions/` is a directory, not the spec's `sessions.json`.** rs-matter's
   `DirKvBlobStore` owns that tree (fabric blob + CASE resumption records); same
   best-effort intent as the spec, different shape on disk.
