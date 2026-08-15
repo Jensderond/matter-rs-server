@@ -260,6 +260,9 @@ There is one fix wave by process, so these are information, not omissions:
    scale"); worst case `attempts × 10s × N_addresses`. `commands/nodes.rs`.
 2. **(Minor) `diagnostics` forwards args to get_nodes**, so a client sending
    `only_available` gets a filtered `nodes` array, contradicting the spec's "all".
+   **[RESOLVED 2026-08-15, plan 3: Node forwards args too
+   (`WebSocketControllerHandler.ts:748-753`); behaviour already matched. The
+   spec table was wrong. Pinned by `diagnostics_forwards_only_available_like_node`.]**
 3. **(Important, Task 19) File the upstream rs-matter serial-number bug.** Needs
    Jens's go-ahead to file from his account; see "Task 19 as executed" for the
    diagnosis and the exact source lines. This replaces finding 1's old "minimal

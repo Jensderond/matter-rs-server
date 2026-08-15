@@ -36,6 +36,10 @@ pub async fn get_node(c: &MatterController, args: &Map<String, Value>) -> Result
         .ok_or_else(|| CommandError::new(ServerErrorCode::NodeNotExists, format!("Node {node_id} does not exist")))
 }
 
+/// Args are forwarded to `get_nodes` on purpose: Node builds `nodes` via
+/// getNodes(args) (`WebSocketControllerHandler.ts:748-753`), so
+/// `only_available` filters here exactly as it does there. The plan-2 command
+/// table's "all nodes" was wrong — see the pinning test.
 pub async fn diagnostics(c: &MatterController, args: &Map<String, Value>) -> Result<Value, CommandError> {
     let nodes = get_nodes(c, args).await?;
     let events: Vec<Value> = lock(&c.history).iter().cloned().collect();
@@ -151,6 +155,7 @@ pub async fn get_node_ip_addresses(c: &MatterController, args: &Map<String, Valu
 #[cfg(test)]
 mod tests {
     use super::{ping_attempts, join_all_concurrent, MAX_PING_ATTEMPTS};
+    use crate::real::test_rig::*;
     use serde_json::json;
 
     /// The clamp itself, since exercising it through `ping_node` would mean
@@ -201,5 +206,22 @@ mod tests {
         assert_eq!(out, vec![1, 2], "input order, not completion order");
         assert!(start.elapsed() < std::time::Duration::from_millis(550),
                 "concurrent would be ~300ms; sequential would be >=600ms");
+    }
+
+    /// Verified against the Node source 2026-08-15: diagnostics builds its
+    /// nodes array via getNodes WITH the caller's args
+    /// (WebSocketControllerHandler.ts:748-753), and getNodes honours
+    /// only_available (line 1097). The plan-2 spec table said "all nodes";
+    /// the reference implementation disagrees, and the reference wins. This
+    /// test exists so nobody "fixes" the passthrough toward the wrong spec.
+    #[tokio::test]
+    async fn diagnostics_forwards_only_available_like_node() {
+        let r = rig_with_nodes(vec![node_record(1), node_record(2)]);
+        // Neither node has a live supervisor, so both are unavailable.
+        let v = call(&r, "diagnostics", json!({})).await.unwrap();
+        assert_eq!(v["nodes"].as_array().unwrap().len(), 2);
+        let v = call(&r, "diagnostics", json!({"only_available": true}))
+            .await.unwrap();
+        assert_eq!(v["nodes"].as_array().unwrap().len(), 0);
     }
 }
