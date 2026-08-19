@@ -804,7 +804,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1120,7 +1120,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2145,7 +2145,7 @@ dependencies = [
 [[package]]
 name = "rs-matter"
 version = "0.2.0"
-source = "git+https://github.com/Jensderond/rs-matter?rev=405064b63d152020c76e182d782e5d45e7eb1c0c#405064b63d152020c76e182d782e5d45e7eb1c0c"
+source = "git+https://github.com/Jensderond/rs-matter?rev=1be65c1a9c685bfcd0555719d1ec1f391cdb812f#1be65c1a9c685bfcd0555719d1ec1f391cdb812f"
 dependencies = [
  "aes",
  "async-io",
@@ -2202,7 +2202,7 @@ dependencies = [
 [[package]]
 name = "rs-matter-codegen"
 version = "0.2.0"
-source = "git+https://github.com/Jensderond/rs-matter?rev=405064b63d152020c76e182d782e5d45e7eb1c0c#405064b63d152020c76e182d782e5d45e7eb1c0c"
+source = "git+https://github.com/Jensderond/rs-matter?rev=1be65c1a9c685bfcd0555719d1ec1f391cdb812f#1be65c1a9c685bfcd0555719d1ec1f391cdb812f"
 dependencies = [
  "convert_case",
  "miette",
@@ -2221,7 +2221,7 @@ dependencies = [
 [[package]]
 name = "rs-matter-macros"
 version = "0.2.0"
-source = "git+https://github.com/Jensderond/rs-matter?rev=405064b63d152020c76e182d782e5d45e7eb1c0c#405064b63d152020c76e182d782e5d45e7eb1c0c"
+source = "git+https://github.com/Jensderond/rs-matter?rev=1be65c1a9c685bfcd0555719d1ec1f391cdb812f#1be65c1a9c685bfcd0555719d1ec1f391cdb812f"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -2245,7 +2245,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2572,7 +2572,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

@@ -12,7 +12,7 @@ matter-rs-gen = { path = "../gen" }
 # generate_without_fabric_id), needed to mint NOCs against migrated matter.js
 # roots, whose subject DN legally omits the FabricId RDN. Candidate for an
 # upstream PR; repoint at project-chip once merged there.
-rs-matter = { git = "https://github.com/Jensderond/rs-matter", rev = "405064b63d152020c76e182d782e5d45e7eb1c0c", features = ["async-io", "max-sessions-32", "case-resumption"] }
+rs-matter = { git = "https://github.com/Jensderond/rs-matter", rev = "1be65c1a9c685bfcd0555719d1ec1f391cdb812f", features = ["async-io", "max-sessions-32", "case-resumption"] }
 embassy-futures = "0.1"
 embassy-time = { version = "0.5", features = ["std"] }
 embassy-time-queue-utils = { version = "0.3", features = ["generic-queue-64"] }
